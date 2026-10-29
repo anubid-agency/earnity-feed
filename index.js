@@ -379,7 +379,7 @@ function getRegion(cf) {
   const country = cf && typeof cf.country === 'string' ? cf.country : null;
   if (!country) return 'ALL';
   const region = cf && typeof cf.region === 'string' && cf.region ? cf.region : 'unknown';
-  return country + ':' + region;
+    return (country + ':' + region).slice(0, 32);
 }
 
 async function hashClientIp(request, env) {
