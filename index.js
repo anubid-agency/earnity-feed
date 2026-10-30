@@ -1,50 +1,76 @@
 /**
- * earnity-catalog — Cloudflare Worker
- * Businesses, products, categories, offers, commissions, referee slots.
- * Does NOT do feed, search, click tracking, orders, payments, wallets or admin.
+ * earnity-feed — Cloudflare Worker
+ * Home feed, search, click/interest tracking.
+ * Owns only its own tables: events, user_interests, product_daily_stats,
+ * product_dismissals, picker_usage.
  *
  * Bindings: DB (D1), FIREBASE_PROJECT_ID, HASH_SALT, INTERNAL_KEY
- * Deployed via GitHub → Cloudflare Workers Builds.
  */
 
 const JWKS_URL =
   'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
 const ALLOWED_HOST = 'earnityug.com';
 
-/* -------------------- EDIT THESE STARTING VALUES -------------------- */
-const BASIC_MAX_ACTIVE_PRODUCTS = 200;
-const BASIC_MAX_PRICE_UGX = 1_000_000;
-const BASIC_MAX_DELIVERY_DAYS = 14;
-const ABSOLUTE_MAX_PRICE_UGX = 25_000_000;
-/* ------------------------------------------------------------------- */
+/* ------------------------- TUNABLE CONSTANTS ------------------------ */
+const HALF_LIFE_SECONDS = 14 * 86400;
+const INTEREST_CAP = 100_000;
 
-const SLOT_TTL_SECONDS = 7 * 86400;
-const OFFER_MAX_SPAN_SECONDS = 30 * 86400;
+const W_INTEREST = 1.0;
+const W_TREND = 0.6;
+const W_FRESH = 0.4;
+const W_DISCOVERY = 0.3;
+
+const FEED_PAGE_DEFAULT = 20;
+const FEED_PAGE_MAX = 20;
+const FEED_POOL_SIZE = 200;
+const FEED_MAX_OFFSET = 200;
+const FEED_BUCKET_SECONDS = 900;
+const FEED_MAX_PER_BUSINESS = 3;
+
+const TRENDING_DAYS = 7;
+const FRESH_SECONDS = 7 * 86400;
+const POPULAR_WINDOW_DAYS = 7;
+
+const SEARCH_PAGE_SIZE = 20;
+const SUGGEST_LIMIT = 8;
+
+const EVENT_WEIGHTS = {
+  view: 1,
+  click: 3,
+  three_dot_open: 2,
+  search: 2,
+  filter: 3,
+  share: 5,
+  not_interested: -8,
+  buy: 10,
+  slot_claim: 6,
+};
+
+const CLIENT_EVENT_TYPES = new Set([
+  'view', 'click', 'three_dot_open', 'search', 'filter', 'share', 'not_interested',
+]);
+const INTERNAL_EVENT_TYPES = new Set(['buy', 'slot_claim']);
+
+const MAX_EVENTS_PER_BATCH = 20;
+const MAX_QUERY_LEN = 80;
+const MAX_SEARCH_Q_LEN = 60;
+const MAX_SUGGEST_Q_LEN = 40;
+
+const RATE_OWNER_PER_HOUR = 200;
+const RATE_IP_PER_HOUR = 1000;
+
+const PURGE_EVENTS_DAYS = 90;
+const PURGE_STATS_DAYS = 30;
+const PURGE_VISITOR_INTERESTS_DAYS = 90;
+const PURGE_CHUNK = 5000;
+
 const MAX_BODY_BYTES = 8192;
 const MAX_ID_LENGTH = 128;
-const MAX_SUBDOMAIN_LENGTH = 30;
-const MIN_SUBDOMAIN_LENGTH = 3;
-const MAX_PAGE_LIMIT = 20;
 const CLOCK_SKEW_SECONDS = 60;
 const JWKS_CACHE_SECONDS = 3600;
 const KEY_CACHE_MS = 3600_000;
-const MAX_TURNSTILE_TOKEN_LENGTH = 2048;
 const MAX_SUB_LENGTH = 128;
-const PUBLIC_CACHE_SECONDS = 30;
-const MAX_IMAGES = 6;
-const MIN_COMMISSION_BPS = 100;
-const MIN_REFERRER_BPS = 100;
-const PUBLIC_TERMS_VERSION = 'catalog-terms-2026-10';
-
-const RESERVED_SUBDOMAINS = new Set([
-  'www','api','admin','mail','support','help','earnity','root','system',
-  'staff','verify','catalog','site','orders','payments','payouts','notify',
-  'cron','ledger',
-]);
-
-const CLOUDINARY_ID_RE = /^[a-zA-Z0-9_\-\/]{1,200}$/;
-const SUBDOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$/;
-const URL_RE = /^https?:\/\/[^\s<>"']{1,480}$/;
+const VISITOR_ID_RE = /^[A-Za-z0-9_-]{22,36}$/;
 
 const enc = new TextEncoder();
 
@@ -78,9 +104,9 @@ function json(data, status, cors, extraHeaders = {}) {
   });
 }
 
-function publicJson(data, status, cors) {
+function publicJson(data, status, cors, seconds) {
   return json(data, status, cors, {
-    'Cache-Control': `public, max-age=${PUBLIC_CACHE_SECONDS}`,
+    'Cache-Control': `public, max-age=${seconds || 30}`,
   });
 }
 
@@ -88,8 +114,8 @@ function corsHeaders(origin) {
   if (!origin) return { Vary: 'Origin' };
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Visitor-Id',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
@@ -143,6 +169,22 @@ function b64urlDecode(input) {
   return bytes;
 }
 
+function b64urlEncodeUtf8(str) {
+  const bytes = enc.encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function b64urlDecodeUtf8(str) {
+  let s = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
 function timingSafeEqual(a, b) {
   const len = Math.max(a.length, b.length);
   let diff = a.length ^ b.length;
@@ -194,7 +236,7 @@ async function hmacHex(env, message) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Firebase ID token verification                                     */
+/* Firebase ID token verification (same as earnity-catalog)           */
 /* ------------------------------------------------------------------ */
 
 async function getJwks(env, force) {
@@ -288,9 +330,9 @@ async function verifyFirebaseToken(token, env, now) {
   return payload;
 }
 
-async function requireAuth(request, env, now) {
+async function loadUserFromRequest(request, env, now) {
   const auth = request.headers.get('Authorization');
-  if (!auth) throw new HttpError(401, 'unauthorized');
+  if (!auth) return null;
   const match = auth.match(/^Bearer\s+(.+)$/i);
   if (!match) throw new HttpError(401, 'unauthorized');
   let payload;
@@ -301,115 +343,64 @@ async function requireAuth(request, env, now) {
   }
   const user = await env.DB.prepare(
     'SELECT id, account_type, status FROM users WHERE firebase_uid = ? LIMIT 1'
-  )
-    .bind(payload.sub)
-    .first();
+  ).bind(payload.sub).first();
   if (!user) throw new HttpError(404, 'not_registered');
   if (user.status === 'blocked') throw new HttpError(403, 'account_blocked');
-  return { user, payload };
-}
-
-function requireAccountType(user, expected) {
-  if (user.account_type !== expected) {
-    throw new HttpError(403, 'wrong_account_type');
-  }
-}
-
-function requireAdmin(user) {
-  // Not exposed by this Worker; only internal key auth is used.
-  if (!user) throw new HttpError(403, 'forbidden');
+  return user;
 }
 
 /* ------------------------------------------------------------------ */
-/* Audit helper                                                       */
+/* Identity / privacy                                                 */
 /* ------------------------------------------------------------------ */
 
-function auditStmt(env, id, actorId, action, targetType, targetId, metadata, ipHash, now) {
-  return env.DB.prepare(
-    `INSERT INTO audit_log
-       (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
-    id,
-    actorId,
-    action,
-    targetType,
-    targetId,
-    JSON.stringify(metadata || {}),
-    ipHash,
-    now
-  );
+function validateVisitorId(raw) {
+  if (raw == null) return null;
+  if (typeof raw !== 'string') throw new HttpError(400, 'invalid_visitor_id');
+  const v = raw.trim();
+  if (!VISITOR_ID_RE.test(v)) throw new HttpError(400, 'invalid_visitor_id');
+  return v;
 }
 
-/* ------------------------------------------------------------------ */
-/* Validation                                                         */
-/* ------------------------------------------------------------------ */
-
-function assertId(value, code) {
-  if (typeof value !== 'string' || value.length === 0 || value.length >= MAX_ID_LENGTH) {
-    throw new HttpError(400, code || 'invalid_id');
-  }
-  return value;
+function hasPrivacyHeader(request) {
+  const dnt = request.headers.get('DNT');
+  const gpc = request.headers.get('Sec-GPC');
+  return dnt === '1' || gpc === '1';
 }
 
-function assertString(value, { min = 0, max, code } = {}) {
-  if (typeof value !== 'string') throw new HttpError(400, code || 'invalid_string');
-  if (value.length < min || (max != null && value.length > max)) {
-    throw new HttpError(400, code || 'invalid_string');
-  }
-  return value;
+function resolveOwner(request, user) {
+  if (user) return { ownerKey: 'u:' + user.id, userId: user.id, visitorId: null };
+  const headerRaw = request.headers.get('X-Visitor-Id');
+  const visitorId = validateVisitorId(headerRaw);
+  if (!visitorId) return null;
+  return { ownerKey: 'v:' + visitorId, userId: null, visitorId };
 }
 
-function assertInt(value, { min, max, code } = {}) {
-  if (!Number.isInteger(value)) throw new HttpError(400, code || 'invalid_integer');
-  if (min != null && value < min) throw new HttpError(400, code || 'invalid_integer');
-  if (max != null && value > max) throw new HttpError(400, code || 'invalid_integer');
-  return value;
+function getRegion(cf) {
+  const country = cf && typeof cf.country === 'string' ? cf.country : null;
+  if (!country) return 'ALL';
+  const region = cf && typeof cf.region === 'string' && cf.region ? cf.region : 'unknown';
+    return (country + ':' + region).slice(0, 32);
 }
 
-function validateSubdomain(input) {
-  if (typeof input !== 'string') throw new HttpError(400, 'invalid_subdomain');
-  const s = input.toLowerCase().trim();
-  if (s.length < MIN_SUBDOMAIN_LENGTH || s.length > MAX_SUBDOMAIN_LENGTH) {
-    throw new HttpError(400, 'invalid_subdomain');
-  }
-  if (!SUBDOMAIN_RE.test(s)) throw new HttpError(400, 'invalid_subdomain');
-  if (s.startsWith('-') || s.endsWith('-')) throw new HttpError(400, 'invalid_subdomain');
-  if (RESERVED_SUBDOMAINS.has(s)) throw new HttpError(409, 'subdomain_reserved');
-  return s;
-}
-
-function validateImageIds(ids) {
-  if (!Array.isArray(ids)) throw new HttpError(400, 'invalid_images');
-  if (ids.length > MAX_IMAGES) throw new HttpError(400, 'invalid_images');
-  const out = [];
-  for (const id of ids) {
-    if (typeof id !== 'string' || !CLOUDINARY_ID_RE.test(id)) {
-      throw new HttpError(400, 'invalid_images');
-    }
-    out.push(id);
-  }
-  return out;
-}
-
-function validateOnlineUrl(url) {
-  if (url === null || url === undefined || url === '') return null;
-  if (typeof url !== 'string' || !URL_RE.test(url)) {
-    throw new HttpError(400, 'invalid_url');
-  }
-  return url;
-}
-
-function checkCloudinaryId(value, code) {
-  if (value === null || value === undefined || value === '') return null;
-  if (typeof value !== 'string' || !CLOUDINARY_ID_RE.test(value)) {
-    throw new HttpError(400, code);
-  }
-  return value;
+async function hashClientIp(request, env) {
+  const ip = request.headers.get('CF-Connecting-IP') || '';
+  if (!ip) return null;
+  return hmacHex(env, 'ip:' + ip);
 }
 
 /* ------------------------------------------------------------------ */
-/* Effective price / cap helpers                                      */
+/* Interest math                                                      */
+/* ------------------------------------------------------------------ */
+
+function decayScore(oldScore, elapsedSeconds) {
+  if (oldScore <= 0) return 0;
+  if (elapsedSeconds <= 0) return oldScore;
+  const factor = Math.pow(0.5, elapsedSeconds / HALF_LIFE_SECONDS);
+  return Math.floor(oldScore * factor);
+}
+
+/* ------------------------------------------------------------------ */
+/* Effective price + slots                                            */
 /* ------------------------------------------------------------------ */
 
 function effectivePrice(product, now) {
@@ -423,1098 +414,929 @@ function effectivePrice(product, now) {
   return { price, offer_active: hasOffer };
 }
 
-async function loadPlatformSettings(env) {
-  const rows = await env.DB.prepare(
-    'SELECT key, value_int FROM platform_settings WHERE key IN (?, ?, ?)'
-  )
-    .bind('earnity_bps', 'seller_reserve_bps', 'deposit_cap_bps')
-    .all();
-  const map = { earnity_bps: 1000, seller_reserve_bps: 500, deposit_cap_bps: 4800 };
-  for (const r of rows.results || []) map[r.key] = Number(r.value_int);
-  return map;
+function firstImage(product) {
+  try {
+    const arr = JSON.parse(product.image_ids || '[]');
+    return Array.isArray(arr) && arr.length > 0 ? String(arr[0]) : null;
+  } catch {
+    return null;
+  }
 }
 
 /* ------------------------------------------------------------------ */
-/* Public handlers                                                    */
+/* /health                                                            */
 /* ------------------------------------------------------------------ */
 
 async function handleHealth(env, now, cors) {
-  return json({ ok: true, service: 'earnity-catalog', time: now }, 200, cors);
+  return json({ ok: true, service: 'earnity-feed', time: now }, 200, cors);
 }
 
-async function handleCategories(env, cors) {
+/* ------------------------------------------------------------------ */
+/* /chips                                                             */
+/* ------------------------------------------------------------------ */
+
+async function handleChips(env, cors) {
+  assertEnv(env, ['DB']);
   const rows = await env.DB.prepare(
     'SELECT id, name, sort_order FROM categories ORDER BY sort_order ASC, name ASC'
   ).all();
-  return publicJson({ categories: rows.results || [] }, 200, cors);
+  const chips = [
+    { id: 'all', name: 'All', kind: 'filter' },
+    { id: 'popular', name: 'Popular', kind: 'filter' },
+    ...(rows.results || []).map((r) => ({ id: r.id, name: r.name, kind: 'category' })),
+  ];
+  return publicJson({ chips }, 200, cors, 60);
 }
 
-async function loadPublicBusinessCard(env, businessId) {
-  return env.DB.prepare(
-    `SELECT id, name, subdomain, description, logo_public_id, banner_public_id,
-            category_id, delivery_text, default_delivery_days, level, delivered_sales, tier
-     FROM businesses
-     WHERE id = ? AND approval_status = 'approved'`
-  ).bind(businessId).first();
+/* ------------------------------------------------------------------ */
+/* Ranking helpers                                                    */
+/* ------------------------------------------------------------------ */
+
+function normaliseMap(map) {
+  let max = 0;
+  for (const v of map.values()) if (v > max) max = v;
+  const out = new Map();
+  if (max <= 0) return out;
+  for (const [k, v] of map) out.set(k, v / max);
+  return out;
 }
 
-function mapPublicProduct(product, business, slotsFree, now) {
-  const { price, offer_active } = effectivePrice(product, now);
-  let imageIds = [];
-  try { imageIds = JSON.parse(product.image_ids || '[]'); } catch { imageIds = []; }
-  return {
-    id: product.id,
-    name: product.name,
-    description: product.description,
-    price_ugx: Number(product.price_ugx),
-    effective_price_ugx: price,
-    offer_active,
-    offer_ends_at: offer_active ? Number(product.offer_ends_at) : null,
-    images: imageIds,
-    category_id: product.category_id,
-    commission_bps: Number(product.commission_bps),
-    delivery_text: product.delivery_text,
-    delivery_days: Number(product.delivery_days),
-    business: business
-      ? {
-          id: business.id,
-          name: business.name,
-          subdomain: business.subdomain,
-          logo_public_id: business.logo_public_id,
-          banner_public_id: business.banner_public_id,
-          level: Number(business.level),
-          delivered_sales: Number(business.delivered_sales),
-        }
-      : null,
-    slots_free: Math.max(0, slotsFree),
-  };
-}
-
-async function handlePublicProduct(env, productId, now, cors) {
-  assertEnv(env, ['DB']);
-  if (typeof productId !== 'string' || productId.length === 0 || productId.length >= MAX_ID_LENGTH) {
-    throw new HttpError(400, 'invalid_id');
-  }
-  const product = await env.DB.prepare(
-    `SELECT * FROM products WHERE id = ? AND status = 'active' LIMIT 1`
-  ).bind(productId).first();
-  if (!product) throw new HttpError(404, 'product_not_found');
-
-  const business = await loadPublicBusinessCard(env, product.business_id);
-  if (!business) throw new HttpError(404, 'product_not_found');
-
-  const used = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM product_referee_slots
-     WHERE product_id = ? AND status IN ('pending','active')`
-  ).bind(product.id).first();
-  const slotsFree = Math.max(0, Number(product.referee_max) - Number(used?.n || 0));
-
-  return publicJson(
-    mapPublicProduct(product, business, slotsFree, now),
-    200,
-    cors
-  );
-}
-
-async function handlePublicStore(env, subdomain, url, now, cors) {
-  assertEnv(env, ['DB']);
-  if (typeof subdomain !== 'string' || subdomain.length < 3 || subdomain.length > 30) {
-    throw new HttpError(400, 'invalid_subdomain');
-  }
-  const business = await env.DB.prepare(
-    `SELECT id, name, subdomain, description, logo_public_id, banner_public_id,
-            category_id, delivery_text, default_delivery_days, level, delivered_sales, tier
-     FROM businesses
-     WHERE subdomain = ? COLLATE NOCASE AND approval_status = 'approved'`
-  ).bind(subdomain).first();
-  if (!business) throw new HttpError(404, 'store_not_found');
-
-  // Cursor = created_at of last item; encoded as integer string.
-  const cursorParam = url.searchParams.get('cursor') || '';
-  let cursor = 0;
-  if (cursorParam) {
-    const n = Number(cursorParam);
-    if (!Number.isInteger(n) || n < 0) throw new HttpError(400, 'invalid_cursor');
-    cursor = n;
-  }
-  const limit = MAX_PAGE_LIMIT;
-
+async function loadTrendingPoints(env, region, now) {
+  const today = Math.floor(now / 86400);
+  const fromDay = today - (TRENDING_DAYS - 1);
   const rows = await env.DB.prepare(
-    `SELECT * FROM products
-     WHERE business_id = ? AND status = 'active' AND created_at < ?
-     ORDER BY created_at DESC
-     LIMIT ?`
-  ).bind(business.id, cursor || 9999999999, limit + 1).all();
+    `SELECT product_id, SUM(points) AS pts
+     FROM product_daily_stats
+     WHERE day >= ? AND region IN (?, 'ALL')
+     GROUP BY product_id`
+  ).bind(fromDay, region).all();
+  const map = new Map();
+  for (const r of rows.results || []) map.set(r.product_id, Number(r.pts || 0));
+  return map;
+}
 
-  const results = rows.results || [];
-  const hasMore = results.length > limit;
-  const page = results.slice(0, limit);
+async function loadOwnerInterests(env, ownerKey) {
+  const rows = await env.DB.prepare(
+    'SELECT category_id, score FROM user_interests WHERE owner_key = ?'
+  ).bind(ownerKey).all();
+  const map = new Map();
+  for (const r of rows.results || []) map.set(r.category_id, Number(r.score));
+  return map;
+}
 
-  // slot-free counts per product for this page
-  const productIds = page.map((p) => p.id);
-  const slotCounts = {};
-  if (productIds.length > 0) {
-    const placeholders = productIds.map(() => '?').join(',');
-    const slotRows = await env.DB.prepare(
+async function loadDismissedProductIds(env, ownerKey) {
+  if (!ownerKey) return new Set();
+  const rows = await env.DB.prepare(
+    'SELECT product_id FROM product_dismissals WHERE owner_key = ?'
+  ).bind(ownerKey).all();
+  return new Set((rows.results || []).map((r) => r.product_id));
+}
+
+/* ------------------------------------------------------------------ */
+/* /feed                                                              */
+/* ------------------------------------------------------------------ */
+
+async function handleFeed(request, env, now, cors) {
+  assertEnv(env, ['DB', 'FIREBASE_PROJECT_ID']);
+
+  const url = new URL(request.url);
+  const limitRaw = url.searchParams.get('limit');
+  let limit = FEED_PAGE_DEFAULT;
+  if (limitRaw != null) {
+    const n = Number(limitRaw);
+    if (!Number.isInteger(n) || n < 1 || n > FEED_PAGE_MAX) {
+      throw new HttpError(400, 'invalid_limit');
+    }
+    limit = n;
+  }
+
+  const categoryParam = url.searchParams.get('category');
+  let categoryId = null;
+  if (categoryParam && categoryParam !== 'all') {
+    if (categoryParam === 'popular') {
+      categoryId = null;
+    } else {
+      if (typeof categoryParam !== 'string' || categoryParam.length > 64) {
+        throw new HttpError(400, 'invalid_category');
+      }
+      const c = await env.DB.prepare('SELECT id FROM categories WHERE id = ? LIMIT 1')
+        .bind(categoryParam).first();
+      if (!c) throw new HttpError(400, 'invalid_category');
+      categoryId = categoryParam;
+    }
+  }
+
+  const user = await loadUserFromRequest(request, env, now);
+  const privacy = hasPrivacyHeader(request);
+  const owner = resolveOwner(request, user);
+  const region = getRegion(request.cf);
+
+  const bucket = Math.floor(now / FEED_BUCKET_SECONDS);
+  let offset = 0;
+  const cursorRaw = url.searchParams.get('cursor');
+  if (cursorRaw) {
+    try {
+      const decoded = JSON.parse(b64urlDecodeUtf8(cursorRaw));
+      if (!decoded || typeof decoded.offset !== 'number' || !Number.isFinite(decoded.offset)) {
+        throw new Error('bad');
+      }
+      offset = Math.max(0, Math.min(FEED_MAX_OFFSET, Math.floor(decoded.offset)));
+    } catch {
+      throw new HttpError(400, 'invalid_cursor');
+    }
+  }
+
+  let interests = new Map();
+  let dismissed = new Set();
+  if (!privacy && owner) {
+    interests = await loadOwnerInterests(env, owner.ownerKey);
+    dismissed = await loadDismissedProductIds(env, owner.ownerKey);
+  }
+
+  const trending = await loadTrendingPoints(env, region, now);
+  const normalisedTrend = normaliseMap(trending);
+  const normalisedInterest = normaliseMap(interests);
+
+  const poolMap = new Map();
+
+  async function fetchProducts(sql, binds) {
+    const rows = await env.DB.prepare(sql).bind(...binds).all();
+    for (const r of rows.results || []) poolMap.set(r.id, r);
+  }
+
+  const baseWhere = `
+    FROM products p
+    JOIN businesses b ON b.id = p.business_id
+    WHERE p.status = 'active' AND b.approval_status = 'approved'
+    ${categoryId ? 'AND p.category_id = ?' : ''}
+  `;
+  const baseBinds = categoryId ? [categoryId] : [];
+
+  const topInterestCats = [...interests.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([c]) => c);
+  if (!privacy && !categoryId && topInterestCats.length > 0) {
+    const placeholders = topInterestCats.map(() => '?').join(',');
+    await fetchProducts(
+      `SELECT p.*, b.discovery_until ${baseWhere} AND p.category_id IN (${placeholders})
+       ORDER BY p.created_at DESC LIMIT 60`,
+      [...baseBinds, ...topInterestCats]
+    );
+  }
+
+  const trendIds = [...trending.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 80)
+    .map(([id]) => id);
+  if (trendIds.length > 0) {
+    const placeholders = trendIds.map(() => '?').join(',');
+    await fetchProducts(
+      `SELECT p.*, b.discovery_until ${baseWhere} AND p.id IN (${placeholders}) LIMIT 80`,
+      [...baseBinds, ...trendIds]
+    );
+  }
+
+  await fetchProducts(
+    `SELECT p.*, b.discovery_until ${baseWhere} ORDER BY p.created_at DESC LIMIT 100`,
+    baseBinds
+  );
+
+  const candidates = [...poolMap.values()]
+    .filter((p) => !dismissed.has(p.id))
+    .slice(0, FEED_POOL_SIZE);
+
+  const slotsUsedMap = new Map();
+  if (candidates.length > 0) {
+    const ids = candidates.map((p) => p.id);
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = await env.DB.prepare(
       `SELECT product_id, COUNT(*) AS n FROM product_referee_slots
        WHERE status IN ('pending','active') AND product_id IN (${placeholders})
        GROUP BY product_id`
-    ).bind(...productIds).all();
-    for (const r of slotRows.results || []) slotCounts[r.product_id] = Number(r.n);
+    ).bind(...ids).all();
+    for (const r of rows.results || []) slotsUsedMap.set(r.product_id, Number(r.n));
   }
 
-  const items = page.map((p) => {
-    const used = slotCounts[p.id] || 0;
-    const slotsFree = Math.max(0, Number(p.referee_max) - used);
-    return mapPublicProduct(p, business, slotsFree, now);
+  const scored = candidates.map((p) => {
+    const { price, offer_active } = effectivePrice(p, now);
+    const trendPts = trending.get(p.id) || 0;
+    const trendNorm = normalisedTrend.get(p.id) || 0;
+    const interestNorm = normalisedInterest.get(p.category_id) || 0;
+    const age = now - Number(p.created_at);
+    const fresh = age >= 0 && age < FRESH_SECONDS ? 1 : 0;
+    const discovery = p.discovery_until && Number(p.discovery_until) > now ? 1 : 0;
+
+    const coldStart = privacy || !owner || interests.size === 0;
+
+    let score;
+    if (coldStart) {
+      score = trendNorm * 1.0 + fresh * 0.1 + (Number(p.created_at) / 1e12);
+    } else {
+      score =
+        interestNorm * W_INTEREST +
+        trendNorm * W_TREND +
+        fresh * W_FRESH +
+        discovery * W_DISCOVERY;
+    }
+
+    return {
+      product: p,
+      price,
+      offer_active,
+      trendPts,
+      score,
+      slotsUsed: slotsUsedMap.get(p.id) || 0,
+    };
   });
 
-  const nextCursor = hasMore ? Number(page[page.length - 1].created_at) : null;
+  function stableHash(id, b) {
+    let h = 2166136261 >>> 0;
+    const s = id + ':' + b;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = (h * 16777619) >>> 0;
+    }
+    return h / 4294967295;
+  }
 
-  return publicJson(
-    { business: {
-        id: business.id,
-        name: business.name,
-        subdomain: business.subdomain,
-        description: business.description,
-        logo_public_id: business.logo_public_id,
-        banner_public_id: business.banner_public_id,
-        category_id: business.category_id,
-        delivery_text: business.delivery_text,
-        default_delivery_days: Number(business.default_delivery_days),
-        level: Number(business.level),
-        delivered_sales: Number(business.delivered_sales),
-        tier: business.tier,
-      },
-      products: items,
-      next_cursor: nextCursor,
-    },
-    200,
-    cors
-  );
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    const ha = stableHash(a.product.id, bucket);
+    const hb = stableHash(b.product.id, bucket);
+    if (hb !== ha) return hb - ha;
+    return a.product.id < b.product.id ? -1 : 1;
+  });
+
+  // Build the diversified order once, then slice by offset so pages never overlap.
+  const ordered = [];
+  let remaining = scored.slice();
+  while (remaining.length > 0 && ordered.length < FEED_POOL_SIZE) {
+    const perBiz = new Map();
+    const block = [];
+    const rest = [];
+    for (const s of remaining) {
+      const biz = s.product.business_id;
+      const used = perBiz.get(biz) || 0;
+      if (block.length < FEED_PAGE_MAX && used < FEED_MAX_PER_BUSINESS) {
+        block.push(s);
+        perBiz.set(biz, used + 1);
+      } else {
+        rest.push(s);
+      }
+    }
+    ordered.push(...block);
+    remaining = rest;
+  }
+  const pageItems = ordered.slice(offset, offset + limit);
+
+  const nextOffset = offset + pageItems.length;
+  const hasMore = nextOffset < ordered.length && nextOffset < FEED_MAX_OFFSET;
+  const next_cursor = hasMore
+    ? b64urlEncodeUtf8(JSON.stringify({ bucket, offset: nextOffset }))
+    : null;
+
+  const bizIds = [...new Set(pageItems.map((s) => s.product.business_id))];
+  const bizMap = new Map();
+  if (bizIds.length > 0) {
+    const placeholders = bizIds.map(() => '?').join(',');
+    const rows = await env.DB.prepare(
+      `SELECT id, name, subdomain, level FROM businesses WHERE id IN (${placeholders})`
+    ).bind(...bizIds).all();
+    for (const r of rows.results || []) bizMap.set(r.id, r);
+  }
+
+  const items = pageItems.map((s) => {
+    const p = s.product;
+    const biz = bizMap.get(p.business_id);
+    const commissionUgx = Math.floor((s.price * Number(p.commission_bps)) / 10000);
+    return {
+      id: p.id,
+      name: p.name,
+      effective_price_ugx: s.price,
+      price_ugx: Number(p.price_ugx),
+      offer_active: s.offer_active,
+      image: firstImage(p),
+      category_id: p.category_id,
+      commission_bps: Number(p.commission_bps),
+      commission_ugx: commissionUgx,
+      slots_free: Math.max(0, Number(p.referee_max) - s.slotsUsed),
+      delivery_days: Number(p.delivery_days),
+      business: biz
+        ? { id: biz.id, name: biz.name, subdomain: biz.subdomain, level: Number(biz.level) }
+        : null,
+    };
+  });
+
+  return json({ items, next_cursor }, 200, cors);
 }
 
 /* ------------------------------------------------------------------ */
-/* Seller handlers                                                    */
+/* /search                                                            */
 /* ------------------------------------------------------------------ */
 
-async function requireSeller(request, env, now) {
-  const { user } = await requireAuth(request, env, now);
-  requireAccountType(user, 'seller');
-  return user;
+function escapeLike(s) {
+  return s.replace(/[\\%_]/g, (m) => '\\' + m);
 }
 
-async function loadOwnedBusiness(env, userId) {
-  return env.DB.prepare('SELECT * FROM businesses WHERE owner_user_id = ? LIMIT 1')
-    .bind(userId).first();
-}
-
-function publicBusinessLimits() {
-  return {
-    tier: 'basic',
-    max_active_products: BASIC_MAX_ACTIVE_PRODUCTS,
-    max_price_ugx: BASIC_MAX_PRICE_UGX,
-    max_delivery_days: BASIC_MAX_DELIVERY_DAYS,
-    absolute_max_price_ugx: ABSOLUTE_MAX_PRICE_UGX,
-  };
-}
-
-async function handleCreateBusiness(request, env, now, cors) {
-  assertEnv(env, ['DB', 'HASH_SALT', 'FIREBASE_PROJECT_ID']);
-  const user = await requireSeller(request, env, now);
-  const body = await readJson(request);
-
-  if (body.accept_seller_terms !== true) {
-    throw new HttpError(400, 'terms_not_accepted');
-  }
-
-  const name = assertString(body.name, { min: 2, max: 120, code: 'invalid_name' });
-  const subdomain = validateSubdomain(body.subdomain);
-  const description = assertString(body.description ?? '', { max: 1000, code: 'invalid_description' });
-  const categoryId = assertId(body.category_id, 'invalid_category');
-  const deliveryText = assertString(body.delivery_text ?? '', { max: 300, code: 'invalid_delivery_text' });
-  const defaultDeliveryDays = assertInt(body.default_delivery_days, {
-    min: 1, max: BASIC_MAX_DELIVERY_DAYS, code: 'invalid_delivery_days',
-  });
-  const addressText = assertString(body.address_text ?? '', { max: 500, code: 'invalid_address' });
-  const onlineUrl = validateOnlineUrl(body.online_presence_url);
-
-  // category must exist
-  const cat = await env.DB.prepare('SELECT id FROM categories WHERE id = ? LIMIT 1')
-    .bind(categoryId).first();
-  if (!cat) throw new HttpError(400, 'invalid_category');
-
-  // referrer lookup (optional)
-  let referrerUserId = null;
-  let referrerBps = 0;
-  if (body.referrer_username != null && body.referrer_username !== '') {
-    const uname = assertString(body.referrer_username, { min: 1, max: 60, code: 'invalid_referrer_username' });
-    const ref = await env.DB.prepare(
-      'SELECT user_id FROM referee_usernames WHERE username = ? COLLATE NOCASE LIMIT 1'
-    ).bind(uname).first();
-    if (!ref) throw new HttpError(400, 'referrer_not_found');
-    if (ref.user_id === user.id) throw new HttpError(400, 'referrer_is_owner');
-    referrerUserId = ref.user_id;
-    referrerBps = MIN_REFERRER_BPS;
-  }
-
-  const ipHash = await hmacHex(env, 'ip:' + (request.headers.get('CF-Connecting-IP') || ''));
-  const businessId = generateId('biz_');
-  const auditId = generateId('aud_');
-
-  const insertStmt = env.DB.prepare(
-    `INSERT INTO businesses
-       (id, owner_user_id, name, subdomain, description, category_id, delivery_text,
-        default_delivery_days, address_text, online_presence_url, terms_version,
-        referrer_user_id, referrer_bps, created_at, updated_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-     WHERE NOT EXISTS (SELECT 1 FROM businesses WHERE owner_user_id = ?)`
-  ).bind(
-    businessId,
-    user.id,
-    name,
-    subdomain,
-    description,
-    categoryId,
-    deliveryText,
-    defaultDeliveryDays,
-    addressText,
-    onlineUrl,
-    PUBLIC_TERMS_VERSION,
-    referrerUserId,
-    referrerBps,
-    now,
-    now,
-    user.id
-  );
-
-  let results;
-  try {
-    results = await env.DB.batch([
-      insertStmt,
-      env.DB.prepare(
-        `INSERT INTO audit_log
-           (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE EXISTS (SELECT 1 FROM businesses WHERE id = ? AND owner_user_id = ?)`
-      ).bind(
-        auditId,
-        user.id,
-        'business_created',
-        'business',
-        businessId,
-        JSON.stringify({ subdomain, category_id: categoryId, has_referrer: referrerUserId !== null }),
-        ipHash,
-        now,
-        businessId,
-        user.id
-      ),
-    ]);
-  } catch (err) {
-    const msg = String(err?.message || '');
-    if (msg.includes('UNIQUE') && msg.toLowerCase().includes('subdomain')) {
-      throw new HttpError(409, 'subdomain_taken');
-    }
-    if (msg.includes('UNIQUE')) {
-      throw new HttpError(409, 'business_exists');
-    }
-    if (msg.includes('referrer_user_id_immutable') || msg.includes('referrer_bps')) {
-      throw new HttpError(400, 'invalid_referrer');
-    }
-    throw err;
-  }
-
-  if ((results[0]?.meta?.changes ?? 0) !== 1) {
-    throw new HttpError(409, 'business_exists');
-  }
-
-  const created = await loadOwnedBusiness(env, user.id);
-
-  return json(
-    {
-      business: {
-        id: created.id,
-        name: created.name,
-        subdomain: created.subdomain,
-        description: created.description,
-        category_id: created.category_id,
-        delivery_text: created.delivery_text,
-        default_delivery_days: Number(created.default_delivery_days),
-        approval_status: created.approval_status,
-        tier: created.tier,
-        referrer_bps: Number(created.referrer_bps),
-        has_referrer: created.referrer_user_id != null,
-        level: Number(created.level),
-        delivered_sales: Number(created.delivered_sales),
-      },
-      limits: publicBusinessLimits(),
-    },
-    201,
-    cors
-  );
-}
-
-async function handleGetMyBusiness(request, env, now, cors) {
+async function handleSearch(request, env, now, cors) {
   assertEnv(env, ['DB', 'FIREBASE_PROJECT_ID']);
-  const user = await requireSeller(request, env, now);
-  const biz = await loadOwnedBusiness(env, user.id);
-  if (!biz) throw new HttpError(404, 'business_not_found');
+  const url = new URL(request.url);
 
-  const counts = await env.DB.prepare(
-    `SELECT
-       (SELECT COUNT(*) FROM products WHERE business_id = ?) AS product_count,
-       (SELECT COUNT(*) FROM products WHERE business_id = ? AND status = 'active') AS active_product_count`
-  ).bind(biz.id, biz.id).first();
-
-  return json(
-    {
-      business: {
-        id: biz.id,
-        name: biz.name,
-        subdomain: biz.subdomain,
-        description: biz.description,
-        logo_public_id: biz.logo_public_id,
-        banner_public_id: biz.banner_public_id,
-        category_id: biz.category_id,
-        delivery_text: biz.delivery_text,
-        default_delivery_days: Number(biz.default_delivery_days),
-        level: Number(biz.level),
-        delivered_sales: Number(biz.delivered_sales),
-        tier: biz.tier,
-        approval_status: biz.approval_status,
-        address_text: biz.address_text,
-        online_presence_url: biz.online_presence_url,
-        approval_note: biz.approval_note,
-        terms_version: biz.terms_version,
-        referrer_bps: Number(biz.referrer_bps),
-        has_referrer: biz.referrer_user_id != null,
-        discovery_until: biz.discovery_until,
-        created_at: Number(biz.created_at),
-        updated_at: Number(biz.updated_at),
-        product_count: Number(counts?.product_count || 0),
-        active_product_count: Number(counts?.active_product_count || 0),
-      },
-      limits: publicBusinessLimits(),
-    },
-    200,
-    cors
-  );
-}
-
-async function handlePatchMyBusiness(request, env, now, cors) {
-  assertEnv(env, ['DB', 'HASH_SALT', 'FIREBASE_PROJECT_ID']);
-  const user = await requireSeller(request, env, now);
-  const biz = await loadOwnedBusiness(env, user.id);
-  if (!biz) throw new HttpError(404, 'business_not_found');
-  const body = await readJson(request);
-
-  const fields = {};
-  if ('description' in body) {
-    fields.description = assertString(body.description, { max: 1000, code: 'invalid_description' });
-  }
-  if ('logo_public_id' in body) {
-    fields.logo_public_id = checkCloudinaryId(body.logo_public_id, 'invalid_logo');
-  }
-  if ('banner_public_id' in body) {
-    fields.banner_public_id = checkCloudinaryId(body.banner_public_id, 'invalid_banner');
-  }
-  if ('delivery_text' in body) {
-    fields.delivery_text = assertString(body.delivery_text, { max: 300, code: 'invalid_delivery_text' });
-  }
-  if ('default_delivery_days' in body) {
-    fields.default_delivery_days = assertInt(body.default_delivery_days, {
-      min: 1, max: BASIC_MAX_DELIVERY_DAYS, code: 'invalid_delivery_days',
-    });
-  }
-  if ('category_id' in body) {
-    const cid = assertId(body.category_id, 'invalid_category');
-    const cat = await env.DB.prepare('SELECT id FROM categories WHERE id = ? LIMIT 1')
-      .bind(cid).first();
-    if (!cat) throw new HttpError(400, 'invalid_category');
-    fields.category_id = cid;
-  }
-  if ('address_text' in body) {
-    fields.address_text = assertString(body.address_text ?? '', { max: 500, code: 'invalid_address' });
-  }
-  if ('online_presence_url' in body) {
-    fields.online_presence_url = validateOnlineUrl(body.online_presence_url);
+  const qRaw = url.searchParams.get('q') ?? '';
+  const q = String(qRaw).trim();
+  if (q.length < 2 || q.length > MAX_SEARCH_Q_LEN) {
+    throw new HttpError(400, 'invalid_query');
   }
 
-  // Guarded UPDATE: ownership in WHERE.
-  let results = await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE businesses SET
-         description = COALESCE(?, description),
-         logo_public_id = CASE WHEN ? = 1 THEN ? ELSE logo_public_id END,
-         banner_public_id = CASE WHEN ? = 1 THEN ? ELSE banner_public_id END,
-         delivery_text = COALESCE(?, delivery_text),
-         default_delivery_days = COALESCE(?, default_delivery_days),
-         category_id = COALESCE(?, category_id),
-         address_text = COALESCE(?, address_text),
-         online_presence_url = CASE WHEN ? = 1 THEN ? ELSE online_presence_url END,
-         updated_at = ?
-       WHERE owner_user_id = ?`
-    ).bind(
-      fields.description ?? null,
-      'logo_public_id' in fields ? 1 : 0,
-      fields.logo_public_id ?? null,
-      'banner_public_id' in fields ? 1 : 0,
-      fields.banner_public_id ?? null,
-      fields.delivery_text ?? null,
-      fields.default_delivery_days ?? null,
-      fields.category_id ?? null,
-      fields.address_text ?? null,
-      'online_presence_url' in fields ? 1 : 0,
-      fields.online_presence_url ?? null,
-      now,
-      user.id
-    ),
-    env.DB.prepare(
-      `INSERT INTO audit_log
-         (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?
-       WHERE EXISTS (SELECT 1 FROM businesses WHERE id = ? AND owner_user_id = ?)`
-    ).bind(
-      generateId('aud_'),
-      user.id,
-      'business_updated',
-      'business',
-      biz.id,
-      JSON.stringify({ keys: Object.keys(fields) }),
-      await hmacHex(env, 'ip:' + (request.headers.get('CF-Connecting-IP') || '')),
-      now,
-      biz.id,
-      user.id
-    ),
-  ]);
-
-  if ((results[0]?.meta?.changes ?? 0) !== 1) {
-    throw new HttpError(404, 'business_not_found');
+  const catRaw = url.searchParams.get('category');
+  let categoryId = null;
+  if (catRaw && catRaw !== 'all' && catRaw !== 'popular') {
+    if (catRaw.length > 64) throw new HttpError(400, 'invalid_category');
+    const c = await env.DB.prepare('SELECT id FROM categories WHERE id = ? LIMIT 1')
+      .bind(catRaw).first();
+    if (!c) throw new HttpError(400, 'invalid_category');
+    categoryId = catRaw;
   }
 
-  const updated = await loadOwnedBusiness(env, user.id);
-  return json(
-    {
-      business: {
-        id: updated.id,
-        name: updated.name,
-        subdomain: updated.subdomain,
-        description: updated.description,
-        logo_public_id: updated.logo_public_id,
-        banner_public_id: updated.banner_public_id,
-        category_id: updated.category_id,
-        delivery_text: updated.delivery_text,
-        default_delivery_days: Number(updated.default_delivery_days),
-        address_text: updated.address_text,
-        online_presence_url: updated.online_presence_url,
-        updated_at: Number(updated.updated_at),
-      },
-    },
-    200,
-    cors
-  );
-}
-
-async function handleRaiseReferrerRate(request, env, now, cors) {
-  assertEnv(env, ['DB', 'HASH_SALT', 'FIREBASE_PROJECT_ID']);
-  const user = await requireSeller(request, env, now);
-  const biz = await loadOwnedBusiness(env, user.id);
-  if (!biz) throw new HttpError(404, 'business_not_found');
-  const body = await readJson(request);
-  const newBps = assertInt(body.referrer_bps, { min: MIN_REFERRER_BPS, max: 5000, code: 'invalid_referrer_bps' });
-
-  if (biz.referrer_user_id == null) throw new HttpError(400, 'no_referrer');
-  if (newBps <= Number(biz.referrer_bps)) throw new HttpError(400, 'referrer_bps_not_raised');
-
-  const settings = await loadPlatformSettings(env);
-
-  // Highest commission among this business's products.
-  const maxRow = await env.DB.prepare(
-    'SELECT MAX(commission_bps) AS m FROM products WHERE business_id = ?'
-  ).bind(biz.id).first();
-  const maxCommission = Number(maxRow?.m || 0);
-  const total = newBps + maxCommission + settings.earnity_bps + settings.seller_reserve_bps;
-  if (total > settings.deposit_cap_bps) {
-    throw new HttpError(400, 'deposit_cap_exceeded', {
-      max_referrer_bps: settings.deposit_cap_bps - maxCommission - settings.earnity_bps - settings.seller_reserve_bps,
-    });
+  let offset = 0;
+  const cursorRaw = url.searchParams.get('cursor');
+  if (cursorRaw) {
+    try {
+      const decoded = JSON.parse(b64urlDecodeUtf8(cursorRaw));
+      if (!decoded || typeof decoded.offset !== 'number' || !Number.isFinite(decoded.offset)) {
+        throw new Error('bad');
+      }
+      offset = Math.max(0, Math.min(500, Math.floor(decoded.offset)));
+    } catch {
+      throw new HttpError(400, 'invalid_cursor');
+    }
   }
 
-  const ipHash = await hmacHex(env, 'ip:' + (request.headers.get('CF-Connecting-IP') || ''));
-  const results = await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE businesses SET referrer_bps = ?, updated_at = ?
-       WHERE id = ? AND owner_user_id = ? AND referrer_user_id IS NOT NULL AND referrer_bps < ?`
-    ).bind(newBps, now, biz.id, user.id, newBps),
-    env.DB.prepare(
-      `INSERT INTO audit_log
-         (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?
-       WHERE EXISTS (SELECT 1 FROM businesses WHERE id = ? AND referrer_bps = ?)`
-    ).bind(
-      generateId('aud_'),
-      user.id,
-      'referrer_rate_raised',
-      'business',
-      biz.id,
-      JSON.stringify({ old_bps: Number(biz.referrer_bps), new_bps: newBps }),
-      ipHash,
-      now,
-      biz.id,
-      newBps
-    ),
-  ]);
+  const like = '%' + escapeLike(q) + '%';
+  const prefix = escapeLike(q) + '%';
+  const exact = q;
 
-  if ((results[0]?.meta?.changes ?? 0) !== 1) {
-    throw new HttpError(409, 'referrer_bps_not_raised');
-  }
+  const catClause = categoryId ? 'AND p.category_id = ?' : '';
+  const catBind = categoryId ? [categoryId] : [];
 
-  return json({ referrer_bps: newBps }, 200, cors);
-}
-
-async function loadProductOwned(env, productId, userId) {
-  return env.DB.prepare(
-    `SELECT p.*, b.owner_user_id, b.referrer_bps, b.default_delivery_days, b.approval_status
+  const productsRows = await env.DB.prepare(
+    `SELECT p.*, b.name AS biz_name, b.subdomain AS biz_subdomain, b.level AS biz_level,
+       CASE
+         WHEN p.name = ? COLLATE NOCASE THEN 0
+         WHEN p.name LIKE ? ESCAPE '\\' COLLATE NOCASE THEN 1
+         WHEN p.name LIKE ? ESCAPE '\\' COLLATE NOCASE THEN 2
+         WHEN b.name LIKE ? ESCAPE '\\' COLLATE NOCASE THEN 3
+         WHEN b.subdomain LIKE ? ESCAPE '\\' COLLATE NOCASE THEN 3
+         WHEN p.description LIKE ? ESCAPE '\\' COLLATE NOCASE THEN 4
+         ELSE 9
+       END AS rank_bucket
      FROM products p
      JOIN businesses b ON b.id = p.business_id
-     WHERE p.id = ? AND b.owner_user_id = ? LIMIT 1`
-  ).bind(productId, userId).first();
-}
+     WHERE p.status = 'active' AND b.approval_status = 'approved' ${catClause}
+       AND (
+         p.name LIKE ? ESCAPE '\\' COLLATE NOCASE
+         OR p.description LIKE ? ESCAPE '\\' COLLATE NOCASE
+         OR b.name LIKE ? ESCAPE '\\' COLLATE NOCASE
+         OR b.subdomain LIKE ? ESCAPE '\\' COLLATE NOCASE
+       )
+     ORDER BY rank_bucket ASC, p.created_at DESC
+     LIMIT ? OFFSET ?`
+  ).bind(
+    exact, prefix, like, like, like, like,
+    ...catBind,
+    like, like, like, like,
+    SEARCH_PAGE_SIZE + 1, offset
+  ).all();
 
-async function handleCreateProduct(request, env, now, cors) {
-  assertEnv(env, ['DB', 'HASH_SALT', 'FIREBASE_PROJECT_ID']);
-  const user = await requireSeller(request, env, now);
-  const biz = await loadOwnedBusiness(env, user.id);
-  if (!biz) throw new HttpError(404, 'business_not_found');
-  const body = await readJson(request);
+  const prodResults = productsRows.results || [];
+  const hasMoreProducts = prodResults.length > SEARCH_PAGE_SIZE;
+  const pageProducts = prodResults.slice(0, SEARCH_PAGE_SIZE);
 
-  const name = assertString(body.name, { min: 2, max: 120, code: 'invalid_name' });
-  const description = assertString(body.description ?? '', { max: 2000, code: 'invalid_description' });
-  const price = assertInt(body.price_ugx, { min: 1, max: ABSOLUTE_MAX_PRICE_UGX, code: 'invalid_price' });
-  if (price > BASIC_MAX_PRICE_UGX) throw new HttpError(400, 'price_above_limit');
-  const categoryId = assertId(body.category_id, 'invalid_category');
-  const commissionBps = assertInt(body.commission_bps ?? MIN_COMMISSION_BPS, {
-    min: MIN_COMMISSION_BPS, max: 4800, code: 'invalid_commission_bps',
-  });
-  const refereeMax = assertInt(body.referee_max ?? 5, { min: 1, max: 50, code: 'invalid_referee_max' });
-  const deliveryText = assertString(body.delivery_text ?? '', { max: 300, code: 'invalid_delivery_text' });
-  const deliveryDays = assertInt(
-    body.delivery_days ?? Number(biz.default_delivery_days),
-    { min: 1, max: BASIC_MAX_DELIVERY_DAYS, code: 'invalid_delivery_days' }
-  );
-  const imageIds = validateImageIds(body.image_ids ?? []);
-
-  const cat = await env.DB.prepare('SELECT id FROM categories WHERE id = ? LIMIT 1')
-    .bind(categoryId).first();
-  if (!cat) throw new HttpError(400, 'invalid_category');
-
-  // cap check
-  const settings = await loadPlatformSettings(env);
-  const totalBps = commissionBps + Number(biz.referrer_bps) + settings.earnity_bps + settings.seller_reserve_bps;
-  if (totalBps > settings.deposit_cap_bps) {
-    throw new HttpError(400, 'deposit_cap_exceeded', {
-      max_commission_bps: settings.deposit_cap_bps - Number(biz.referrer_bps) - settings.earnity_bps - settings.seller_reserve_bps,
-    });
+  let stores = [];
+  if (offset === 0) {
+    const storeRows = await env.DB.prepare(
+      `SELECT id, name, subdomain, logo_public_id, level, delivered_sales,
+              CASE
+                WHEN name = ? COLLATE NOCASE THEN 0
+                WHEN name LIKE ? ESCAPE '\\' COLLATE NOCASE THEN 1
+                WHEN subdomain LIKE ? ESCAPE '\\' COLLATE NOCASE THEN 2
+                ELSE 3
+              END AS rank_bucket
+       FROM businesses
+       WHERE approval_status = 'approved'
+         AND (name LIKE ? ESCAPE '\\' COLLATE NOCASE
+              OR subdomain LIKE ? ESCAPE '\\' COLLATE NOCASE)
+       ORDER BY rank_bucket ASC, level DESC, delivered_sales DESC
+       LIMIT 10`
+    ).bind(exact, prefix, prefix, like, like).all();
+    stores = (storeRows.results || []).map((r) => ({
+      id: r.id,
+      name: r.name,
+      subdomain: r.subdomain,
+      logo_public_id: r.logo_public_id,
+      level: Number(r.level),
+      delivered_sales: Number(r.delivered_sales),
+    }));
   }
 
-  const productId = generateId('prd_');
-  const ipHash = await hmacHex(env, 'ip:' + (request.headers.get('CF-Connecting-IP') || ''));
-
-  let results;
-  try {
-    results = await env.DB.batch([
-      env.DB.prepare(
-        `INSERT INTO products
-           (id, business_id, name, description, price_ugx, category_id, image_ids,
-            commission_bps, referee_max, delivery_text, delivery_days, created_at, updated_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE (SELECT COUNT(*) FROM products WHERE business_id = ? AND status = 'active') < ?`
-      ).bind(
-        productId, biz.id, name, description, price, categoryId, JSON.stringify(imageIds),
-        commissionBps, refereeMax, deliveryText, deliveryDays, now, now,
-        biz.id, BASIC_MAX_ACTIVE_PRODUCTS
-      ),
-      env.DB.prepare(
-        `INSERT INTO audit_log
-           (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE EXISTS (SELECT 1 FROM products WHERE id = ?)`
-      ).bind(
-        generateId('aud_'),
-        user.id,
-        'product_created',
-        'product',
-        productId,
-        JSON.stringify({ business_id: biz.id, commission_bps: commissionBps, referee_max: refereeMax }),
-        ipHash,
-        now,
-        productId
-      ),
-    ]);
-  } catch (err) {
-    const msg = String(err?.message || '');
-    if (msg.includes('CHECK')) throw new HttpError(400, 'invalid_product');
-    throw err;
+  const slotsUsed = new Map();
+  if (pageProducts.length > 0) {
+    const ids = pageProducts.map((p) => p.id);
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = await env.DB.prepare(
+      `SELECT product_id, COUNT(*) AS n FROM product_referee_slots
+       WHERE status IN ('pending','active') AND product_id IN (${placeholders})
+       GROUP BY product_id`
+    ).bind(...ids).all();
+    for (const r of rows.results || []) slotsUsed.set(r.product_id, Number(r.n));
   }
 
-  if ((results[0]?.meta?.changes ?? 0) !== 1) {
-    throw new HttpError(409, 'product_limit_reached');
-  }
-
-  return json(
-    {
-      product: {
-        id: productId,
-        business_id: biz.id,
-        name,
-        price_ugx: price,
-        commission_bps: commissionBps,
-        referee_max: refereeMax,
-        delivery_days: deliveryDays,
-        status: 'active',
-        visible_publicly: biz.approval_status === 'approved',
+  const products = pageProducts.map((p) => {
+    const { price, offer_active } = effectivePrice(p, now);
+    const commissionUgx = Math.floor((price * Number(p.commission_bps)) / 10000);
+    return {
+      id: p.id,
+      name: p.name,
+      effective_price_ugx: price,
+      price_ugx: Number(p.price_ugx),
+      offer_active,
+      image: firstImage(p),
+      category_id: p.category_id,
+      commission_bps: Number(p.commission_bps),
+      commission_ugx: commissionUgx,
+      slots_free: Math.max(0, Number(p.referee_max) - (slotsUsed.get(p.id) || 0)),
+      delivery_days: Number(p.delivery_days),
+      business: {
+        id: p.business_id,
+        name: p.biz_name,
+        subdomain: p.biz_subdomain,
+        level: Number(p.biz_level),
       },
-    },
-    201,
-    cors
-  );
+    };
+  });
+
+  const next_cursor =
+    hasMoreProducts && offset + pageProducts.length < 500
+      ? b64urlEncodeUtf8(JSON.stringify({ offset: offset + pageProducts.length }))
+      : null;
+
+  const origin = request.headers.get('Origin');
+  const anonymousClean =
+    !request.headers.get('Authorization') &&
+    !request.headers.get('X-Visitor-Id') &&
+    !hasPrivacyHeader(request);
+
+  const payload = { products, stores, next_cursor };
+  if (anonymousClean) {
+    return publicJson(payload, 200, corsHeaders(origin), 30);
+  }
+  return json(payload, 200, corsHeaders(origin));
 }
 
-async function handlePatchProduct(request, env, productId, now, cors) {
+/* ------------------------------------------------------------------ */
+/* /search/suggest                                                    */
+/* ------------------------------------------------------------------ */
+
+async function handleSuggest(request, env, now, cors) {
+  assertEnv(env, ['DB']);
+  const url = new URL(request.url);
+  const q = String(url.searchParams.get('q') || '').trim();
+  if (q.length < 2 || q.length > MAX_SUGGEST_Q_LEN) {
+    throw new HttpError(400, 'invalid_query');
+  }
+  const prefix = escapeLike(q) + '%';
+  const like = '%' + escapeLike(q) + '%';
+
+  const productRows = await env.DB.prepare(
+    `SELECT p.name FROM products p
+     JOIN businesses b ON b.id = p.business_id
+     WHERE p.status = 'active' AND b.approval_status = 'approved'
+       AND p.name LIKE ? ESCAPE '\\' COLLATE NOCASE
+     ORDER BY (p.name LIKE ? ESCAPE '\\' COLLATE NOCASE) DESC, p.created_at DESC
+     LIMIT ?`
+  ).bind(like, prefix, SUGGEST_LIMIT).all();
+
+  const storeRows = await env.DB.prepare(
+    `SELECT name FROM businesses
+     WHERE approval_status = 'approved'
+       AND name LIKE ? ESCAPE '\\' COLLATE NOCASE
+     ORDER BY (name LIKE ? ESCAPE '\\' COLLATE NOCASE) DESC, level DESC
+     LIMIT ?`
+  ).bind(like, prefix, SUGGEST_LIMIT).all();
+
+  const seen = new Set();
+  const out = [];
+  for (const r of productRows.results || []) {
+    const key = 'p:' + r.name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ type: 'product', text: r.name });
+    if (out.length >= SUGGEST_LIMIT) break;
+  }
+  for (const r of storeRows.results || []) {
+    if (out.length >= SUGGEST_LIMIT) break;
+    const key = 's:' + r.name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ type: 'store', text: r.name });
+  }
+
+  return publicJson({ suggestions: out }, 200, cors, 30);
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /events                                                       */
+/* ------------------------------------------------------------------ */
+
+function validateClientEvent(raw, idx) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new HttpError(400, 'invalid_event');
+  }
+  const type = raw.type;
+  if (typeof type !== 'string' || !CLIENT_EVENT_TYPES.has(type)) {
+    throw new HttpError(400, 'invalid_event_type');
+  }
+  const out = { type };
+  if (raw.product_id != null) {
+    if (typeof raw.product_id !== 'string' || raw.product_id.length === 0 || raw.product_id.length >= MAX_ID_LENGTH) {
+      throw new HttpError(400, 'invalid_product_id');
+    }
+    out.product_id = raw.product_id;
+  }
+  if (raw.business_id != null) {
+    if (typeof raw.business_id !== 'string' || raw.business_id.length === 0 || raw.business_id.length >= MAX_ID_LENGTH) {
+      throw new HttpError(400, 'invalid_business_id');
+    }
+    out.business_id = raw.business_id;
+  }
+  if (raw.category_id != null) {
+    if (typeof raw.category_id !== 'string' || raw.category_id.length === 0 || raw.category_id.length > 64) {
+      throw new HttpError(400, 'invalid_category_id');
+    }
+    out.category_id = raw.category_id;
+  }
+  if (raw.query != null) {
+    if (typeof raw.query !== 'string' || raw.query.length > MAX_QUERY_LEN) {
+      throw new HttpError(400, 'invalid_query');
+    }
+    out.query = raw.query;
+  }
+  return out;
+}
+
+async function handlePostEvents(request, env, now, cors) {
   assertEnv(env, ['DB', 'HASH_SALT', 'FIREBASE_PROJECT_ID']);
-  const user = await requireSeller(request, env, now);
-  const product = await loadProductOwned(env, productId, user.id);
-  if (!product) throw new HttpError(404, 'product_not_found');
+
+  const user = await loadUserFromRequest(request, env, now);
+  const privacy = hasPrivacyHeader(request);
+  if (privacy) {
+    try { await readJson(request); } catch { /* ignore */ }
+    return json({ stored: false, reason: 'privacy_header' }, 200, cors);
+  }
+
+  const owner = resolveOwner(request, user);
+  if (!owner) {
+    throw new HttpError(400, 'visitor_id_required');
+  }
+
   const body = await readJson(request);
+  if (!Array.isArray(body.events) || body.events.length === 0) {
+    throw new HttpError(400, 'invalid_events');
+  }
+  if (body.events.length > MAX_EVENTS_PER_BATCH) {
+    throw new HttpError(400, 'too_many_events');
+  }
 
-  const fields = {};
-  if ('name' in body) fields.name = assertString(body.name, { min: 2, max: 120, code: 'invalid_name' });
-  if ('description' in body) fields.description = assertString(body.description, { max: 2000, code: 'invalid_description' });
-  if ('price_ugx' in body) {
-    const p = assertInt(body.price_ugx, { min: 1, max: ABSOLUTE_MAX_PRICE_UGX, code: 'invalid_price' });
-    if (p > BASIC_MAX_PRICE_UGX) throw new HttpError(400, 'price_above_limit');
-    fields.price_ugx = p;
-  }
-  if ('category_id' in body) {
-    const cid = assertId(body.category_id, 'invalid_category');
-    const cat = await env.DB.prepare('SELECT id FROM categories WHERE id = ? LIMIT 1').bind(cid).first();
-    if (!cat) throw new HttpError(400, 'invalid_category');
-    fields.category_id = cid;
-  }
-  if ('commission_bps' in body) {
-    fields.commission_bps = assertInt(body.commission_bps, {
-      min: MIN_COMMISSION_BPS, max: 4800, code: 'invalid_commission_bps',
-    });
-  }
-  if ('referee_max' in body) {
-    const rm = assertInt(body.referee_max, { min: 1, max: 50, code: 'invalid_referee_max' });
-    const used = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM product_referee_slots WHERE product_id = ? AND status IN ('pending','active')`
-    ).bind(product.id).first();
-    if (rm < Number(used?.n || 0)) throw new HttpError(409, 'referee_max_below_used_slots', { used: Number(used?.n || 0) });
-    fields.referee_max = rm;
-  }
-  if ('delivery_text' in body) fields.delivery_text = assertString(body.delivery_text, { max: 300, code: 'invalid_delivery_text' });
-  if ('delivery_days' in body) {
-    fields.delivery_days = assertInt(body.delivery_days, { min: 1, max: BASIC_MAX_DELIVERY_DAYS, code: 'invalid_delivery_days' });
-  }
-  if ('image_ids' in body) fields.image_ids = JSON.stringify(validateImageIds(body.image_ids));
+  const events = body.events.map((raw, i) => validateClientEvent(raw, i));
 
-  // cap check on commission change
-  if (fields.commission_bps != null) {
-    const settings = await loadPlatformSettings(env);
-    const total = fields.commission_bps + Number(product.referrer_bps) + settings.earnity_bps + settings.seller_reserve_bps;
-    if (total > settings.deposit_cap_bps) {
-      throw new HttpError(400, 'deposit_cap_exceeded', {
-        max_commission_bps: settings.deposit_cap_bps - Number(product.referrer_bps) - settings.earnity_bps - settings.seller_reserve_bps,
-      });
+  const productIds = [...new Set(events.map((e) => e.product_id).filter(Boolean))];
+  const productMap = new Map();
+  if (productIds.length > 0) {
+    const placeholders = productIds.map(() => '?').join(',');
+    const rows = await env.DB.prepare(
+      `SELECT p.id, p.business_id, p.category_id
+       FROM products p JOIN businesses b ON b.id = p.business_id
+       WHERE p.id IN (${placeholders})
+         AND p.status = 'active' AND b.approval_status = 'approved'`
+    ).bind(...productIds).all();
+    for (const r of rows.results || []) productMap.set(r.id, r);
+  }
+
+  const enriched = events.map((e) => {
+    const out = { ...e };
+    if (e.product_id) {
+      const p = productMap.get(e.product_id);
+      if (!p) throw new HttpError(400, 'invalid_product_id');
+      out.business_id = p.business_id;
+      out.category_id = p.category_id;
+    }
+    return out;
+  });
+
+  const validCats = new Set(
+    ((await env.DB.prepare('SELECT id FROM categories').all()).results || []).map((r) => r.id)
+  );
+  for (const e of enriched) {
+    if (e.category_id && !validCats.has(e.category_id)) {
+      throw new HttpError(400, 'invalid_category_id');
     }
   }
 
-  const keys = Object.keys(fields);
-  if (keys.length === 0) {
-    return json({ product: { id: product.id, updated: false } }, 200, cors);
+  const ipHash = await hashClientIp(request, env);
+  const region = getRegion(request.cf);
+  const hourAgo = now - 3600;
+
+  const ownerCount = await env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM events WHERE owner_key = ? AND created_at > ?'
+  ).bind(owner.ownerKey, hourAgo).first();
+  if (Number(ownerCount?.n || 0) + enriched.length > RATE_OWNER_PER_HOUR) {
+    throw new HttpError(429, 'rate_limited');
+  }
+  if (ipHash) {
+    const ipCount = await env.DB.prepare(
+      'SELECT COUNT(*) AS n FROM events WHERE ip_hash = ? AND created_at > ?'
+    ).bind(ipHash, hourAgo).first();
+    if (Number(ipCount?.n || 0) + enriched.length > RATE_IP_PER_HOUR) {
+      throw new HttpError(429, 'rate_limited');
+    }
   }
 
-  // Build guarded UPDATE with only allowed fields.
-  const setParts = [];
-  const binds = [];
-  for (const k of keys) {
-    if (k === 'image_ids') { setParts.push(`${k} = ?`); binds.push(fields[k]); }
-    else { setParts.push(`${k} = ?`); binds.push(fields[k]); }
-  }
-  setParts.push('updated_at = ?');
-  binds.push(now);
-  binds.push(product.id, user.id);
-
-  const ipHash = await hmacHex(env, 'ip:' + (request.headers.get('CF-Connecting-IP') || ''));
-
-  const auditAction =
-    fields.commission_bps != null && fields.commission_bps !== Number(product.commission_bps)
-      ? 'product_commission_changed'
-      : fields.referee_max != null && fields.referee_max !== Number(product.referee_max)
-      ? 'referee_max_changed'
-      : 'product_updated';
-
-  const auditMeta = { keys };
-  if (auditAction === 'product_commission_changed') {
-    auditMeta.old_bps = Number(product.commission_bps);
-    auditMeta.new_bps = fields.commission_bps;
-  }
-  if (auditAction === 'referee_max_changed') {
-    auditMeta.old = Number(product.referee_max);
-    auditMeta.new = fields.referee_max;
+  const involvedCats = [...new Set(enriched.map((e) => e.category_id).filter(Boolean))];
+  const currentInterests = new Map();
+  if (involvedCats.length > 0) {
+    const placeholders = involvedCats.map(() => '?').join(',');
+    const rows = await env.DB.prepare(
+      `SELECT category_id, score, updated_at FROM user_interests
+       WHERE owner_key = ? AND category_id IN (${placeholders})`
+    ).bind(owner.ownerKey, ...involvedCats).all();
+    for (const r of rows.results || []) {
+      currentInterests.set(r.category_id, { score: Number(r.score), updated_at: Number(r.updated_at) });
+    }
   }
 
-  let results;
-  try {
-    results = await env.DB.batch([
+  const interestDeltas = new Map();
+  for (const e of enriched) {
+    const w = EVENT_WEIGHTS[e.type] || 0;
+    if (!w) continue;
+    if ((e.type === 'search' || e.type === 'filter') && !e.category_id) continue;
+    if (!e.category_id) continue;
+    interestDeltas.set(e.category_id, (interestDeltas.get(e.category_id) || 0) + w);
+  }
+
+  const batchStmts = [];
+
+  for (const e of enriched) {
+    batchStmts.push(
       env.DB.prepare(
-        `UPDATE products SET ${setParts.join(', ')}
-         WHERE id = ? AND business_id IN (SELECT id FROM businesses WHERE owner_user_id = ?)`
-      ).bind(...binds),
-      env.DB.prepare(
-        `INSERT INTO audit_log
-           (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE EXISTS (SELECT 1 FROM products WHERE id = ?)`
+        `INSERT INTO events
+           (id, owner_key, user_id, visitor_id, type, product_id, business_id,
+            category_id, query, region, ip_hash, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
-        generateId('aud_'), user.id, auditAction, 'product', product.id,
-        JSON.stringify(auditMeta), ipHash, now, product.id
-      ),
-    ]);
-  } catch (err) {
-    const msg = String(err?.message || '');
-    if (msg.includes('CHECK')) throw new HttpError(400, 'invalid_product');
-    throw err;
+        generateId('evt_'),
+        owner.ownerKey,
+        owner.userId,
+        owner.visitorId,
+        e.type,
+        e.product_id || null,
+        e.business_id || null,
+        e.category_id || null,
+        e.query || null,
+        region,
+        ipHash,
+        now
+      )
+    );
   }
 
-  if ((results[0]?.meta?.changes ?? 0) !== 1) {
-    throw new HttpError(404, 'product_not_found');
+  for (const [categoryId, delta] of interestDeltas) {
+    const cur = currentInterests.get(categoryId) || { score: 0, updated_at: now };
+    const decayed = decayScore(cur.score, Math.max(0, now - cur.updated_at));
+    let next = decayed + delta;
+    if (next < 0) next = 0;
+    if (next > INTEREST_CAP) next = INTEREST_CAP;
+
+    batchStmts.push(
+      env.DB.prepare(
+        `INSERT INTO user_interests (owner_key, category_id, score, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(owner_key, category_id) DO UPDATE SET
+           score = excluded.score,
+           updated_at = excluded.updated_at`
+      ).bind(owner.ownerKey, categoryId, next, now)
+    );
   }
 
-  const updated = await loadProductOwned(env, product.id, user.id);
-  return json(
-    {
-      product: {
-        id: updated.id,
-        name: updated.name,
-        description: updated.description,
-        price_ugx: Number(updated.price_ugx),
-        offer_price_ugx: updated.offer_price_ugx != null ? Number(updated.offer_price_ugx) : null,
-        offer_starts_at: updated.offer_starts_at,
-        offer_ends_at: updated.offer_ends_at,
-        category_id: updated.category_id,
-        image_ids: JSON.parse(updated.image_ids || '[]'),
-        commission_bps: Number(updated.commission_bps),
-        referee_max: Number(updated.referee_max),
-        delivery_text: updated.delivery_text,
-        delivery_days: Number(updated.delivery_days),
-        status: updated.status,
-        updated_at: Number(updated.updated_at),
-      },
-    },
-    200,
-    cors
-  );
+  const today = Math.floor(now / 86400);
+  for (const e of enriched) {
+    if (!e.product_id) continue;
+    const w = EVENT_WEIGHTS[e.type] || 0;
+    if (w <= 0) continue;
+    for (const reg of new Set([region, 'ALL'])) {
+      batchStmts.push(
+        env.DB.prepare(
+          `INSERT INTO product_daily_stats (day, product_id, region, points)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(day, product_id, region) DO UPDATE SET
+             points = points + excluded.points`
+        ).bind(today, e.product_id, reg, w)
+      );
+    }
+  }
+
+  for (const e of enriched) {
+    if (e.type !== 'not_interested' || !e.product_id) continue;
+    batchStmts.push(
+      env.DB.prepare(
+        `INSERT INTO product_dismissals (owner_key, product_id, created_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(owner_key, product_id) DO NOTHING`
+      ).bind(owner.ownerKey, e.product_id, now)
+    );
+  }
+
+  if (batchStmts.length > 0) {
+    await env.DB.batch(batchStmts);
+  }
+
+  return json({ stored: true, count: enriched.length }, 200, cors);
 }
 
-async function handleSetOffer(request, env, productId, now, cors) {
+/* ------------------------------------------------------------------ */
+/* POST /events/link                                                  */
+/* ------------------------------------------------------------------ */
+
+async function handleEventsLink(request, env, now, cors) {
   assertEnv(env, ['DB', 'HASH_SALT', 'FIREBASE_PROJECT_ID']);
-  const user = await requireSeller(request, env, now);
-  const product = await loadProductOwned(env, productId, user.id);
-  if (!product) throw new HttpError(404, 'product_not_found');
+
+  const user = await loadUserFromRequest(request, env, now);
+  if (!user) throw new HttpError(401, 'unauthorized');
+  const visitorId = validateVisitorId(request.headers.get('X-Visitor-Id'));
+  if (!visitorId) throw new HttpError(400, 'visitor_id_required');
+
+  const userKey = 'u:' + user.id;
+  const visitorKey = 'v:' + visitorId;
+
+  const visitorRows = await env.DB.prepare(
+    'SELECT category_id, score, updated_at FROM user_interests WHERE owner_key = ?'
+  ).bind(visitorKey).all();
+
+  const rows = visitorRows.results || [];
+  if (rows.length === 0) {
+    const dismissals = await env.DB.prepare(
+      'SELECT product_id FROM product_dismissals WHERE owner_key = ?'
+    ).bind(visitorKey).all();
+    const dRows = dismissals.results || [];
+    if (dRows.length > 0) {
+      const batchStmts = [];
+      for (const d of dRows) {
+        batchStmts.push(
+          env.DB.prepare(
+            `INSERT INTO product_dismissals (owner_key, product_id, created_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(owner_key, product_id) DO NOTHING`
+          ).bind(userKey, d.product_id, now)
+        );
+      }
+      batchStmts.push(
+        env.DB.prepare('DELETE FROM product_dismissals WHERE owner_key = ?').bind(visitorKey)
+      );
+      await env.DB.batch(batchStmts);
+    }
+    return json({ merged: 0 }, 200, cors);
+  }
+
+  const userRows = await env.DB.prepare(
+    'SELECT category_id, score, updated_at FROM user_interests WHERE owner_key = ?'
+  ).bind(userKey).all();
+  const userMap = new Map();
+  for (const r of userRows.results || []) {
+    userMap.set(r.category_id, { score: Number(r.score), updated_at: Number(r.updated_at) });
+  }
+
+  const batchStmts = [];
+  let merged = 0;
+  for (const v of rows) {
+    const userCur = userMap.get(v.category_id) || { score: 0, updated_at: now };
+    const userDecayed = decayScore(userCur.score, Math.max(0, now - userCur.updated_at));
+    const visitorDecayed = decayScore(Number(v.score), Math.max(0, now - Number(v.updated_at)));
+    let next = userDecayed + visitorDecayed;
+    if (next > INTEREST_CAP) next = INTEREST_CAP;
+    if (next < 0) next = 0;
+
+    batchStmts.push(
+      env.DB.prepare(
+        `INSERT INTO user_interests (owner_key, category_id, score, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(owner_key, category_id) DO UPDATE SET
+           score = excluded.score,
+           updated_at = excluded.updated_at`
+      ).bind(userKey, v.category_id, next, now)
+    );
+    merged++;
+  }
+
+  const dismissals = await env.DB.prepare(
+    'SELECT product_id FROM product_dismissals WHERE owner_key = ?'
+  ).bind(visitorKey).all();
+  for (const d of dismissals.results || []) {
+    batchStmts.push(
+      env.DB.prepare(
+        `INSERT INTO product_dismissals (owner_key, product_id, created_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(owner_key, product_id) DO NOTHING`
+      ).bind(userKey, d.product_id, now)
+    );
+  }
+
+  batchStmts.push(
+    env.DB.prepare('DELETE FROM user_interests WHERE owner_key = ?').bind(visitorKey)
+  );
+  batchStmts.push(
+    env.DB.prepare('DELETE FROM product_dismissals WHERE owner_key = ?').bind(visitorKey)
+  );
+
+  await env.DB.batch(batchStmts);
+  return json({ merged }, 200, cors);
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /interests/picker                                             */
+/* ------------------------------------------------------------------ */
+
+async function handleInterestPicker(request, env, now, cors) {
+  assertEnv(env, ['DB', 'FIREBASE_PROJECT_ID']);
+
+  const user = await loadUserFromRequest(request, env, now);
+  const owner = resolveOwner(request, user);
+  if (!owner) throw new HttpError(400, 'visitor_id_required');
+  if (hasPrivacyHeader(request)) throw new HttpError(403, 'privacy_header');
+
   const body = await readJson(request);
-
-  const ipHash = await hmacHex(env, 'ip:' + (request.headers.get('CF-Connecting-IP') || ''));
-
-  // Clear offer if requested.
-  if (body.clear === true) {
-    const results = await env.DB.batch([
-      env.DB.prepare(
-        `UPDATE products SET offer_price_ugx = NULL, offer_starts_at = NULL, offer_ends_at = NULL, updated_at = ?
-         WHERE id = ? AND business_id IN (SELECT id FROM businesses WHERE owner_user_id = ?)`
-      ).bind(now, product.id, user.id),
-      env.DB.prepare(
-        `INSERT INTO audit_log
-           (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE EXISTS (SELECT 1 FROM products WHERE id = ?)`
-      ).bind(
-        generateId('aud_'), user.id, 'offer_cleared', 'product', product.id,
-        JSON.stringify({ previous_offer_price_ugx: product.offer_price_ugx }),
-        ipHash, now, product.id
-      ),
-    ]);
-    if ((results[0]?.meta?.changes ?? 0) !== 1) throw new HttpError(404, 'product_not_found');
-    return json({ product_id: product.id, offer: null }, 200, cors);
+  if (!Array.isArray(body.category_ids) || body.category_ids.length < 1 || body.category_ids.length > 3) {
+    throw new HttpError(400, 'invalid_category_ids');
+  }
+  const catIds = [];
+  for (const cid of body.category_ids) {
+    if (typeof cid !== 'string' || cid.length === 0 || cid.length > 64) {
+      throw new HttpError(400, 'invalid_category_id');
+    }
+    catIds.push(cid);
+  }
+  const placeholders = catIds.map(() => '?').join(',');
+  const catRows = await env.DB.prepare(
+    `SELECT id FROM categories WHERE id IN (${placeholders})`
+  ).bind(...catIds).all();
+  const found = new Set((catRows.results || []).map((r) => r.id));
+  for (const cid of catIds) {
+    if (!found.has(cid)) throw new HttpError(400, 'invalid_category_id');
   }
 
-  const offerPrice = assertInt(body.offer_price_ugx, { min: 1, max: ABSOLUTE_MAX_PRICE_UGX, code: 'invalid_offer_price' });
-  if (offerPrice >= Number(product.price_ugx)) throw new HttpError(400, 'offer_price_not_lower');
-  const startsAt = assertInt(body.offer_starts_at, { min: 0, max: 4102444800, code: 'invalid_offer_start' });
-  const endsAt = assertInt(body.offer_ends_at, { min: 0, max: 4102444800, code: 'invalid_offer_end' });
-  if (endsAt <= startsAt) throw new HttpError(400, 'invalid_offer_range');
-  if (endsAt - startsAt > OFFER_MAX_SPAN_SECONDS) throw new HttpError(400, 'offer_too_long');
-
-  const results = await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE products SET offer_price_ugx = ?, offer_starts_at = ?, offer_ends_at = ?, updated_at = ?
-       WHERE id = ? AND business_id IN (SELECT id FROM businesses WHERE owner_user_id = ?)`
-    ).bind(offerPrice, startsAt, endsAt, now, product.id, user.id),
-    env.DB.prepare(
-      `INSERT INTO audit_log
-         (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?
-       WHERE EXISTS (SELECT 1 FROM products WHERE id = ?)`
-    ).bind(
-      generateId('aud_'), user.id, 'offer_set', 'product', product.id,
-      JSON.stringify({ offer_price_ugx: offerPrice, starts_at: startsAt, ends_at: endsAt }),
-      ipHash, now, product.id
-    ),
-  ]);
-  if ((results[0]?.meta?.changes ?? 0) !== 1) throw new HttpError(404, 'product_not_found');
-
-  return json(
-    { product_id: product.id, offer: { offer_price_ugx: offerPrice, starts_at: startsAt, ends_at: endsAt } },
-    200,
-    cors
-  );
-}
-
-async function handleSetStatus(request, env, productId, now, cors) {
-  assertEnv(env, ['DB', 'HASH_SALT', 'FIREBASE_PROJECT_ID']);
-  const user = await requireSeller(request, env, now);
-  const product = await loadProductOwned(env, productId, user.id);
-  if (!product) throw new HttpError(404, 'product_not_found');
-  const body = await readJson(request);
-  const status = body.status;
-  if (status !== 'active' && status !== 'hidden') throw new HttpError(400, 'invalid_status');
-
-  const results = await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE products SET status = ?, updated_at = ?
-       WHERE id = ? AND business_id IN (SELECT id FROM businesses WHERE owner_user_id = ?)`
-    ).bind(status, now, product.id, user.id),
-    env.DB.prepare(
-      `INSERT INTO audit_log
-         (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?
-       WHERE EXISTS (SELECT 1 FROM products WHERE id = ?)`
-    ).bind(
-      generateId('aud_'), user.id, 'product_updated', 'product', product.id,
-      JSON.stringify({ status }), await hmacHex(env, 'ip:' + (request.headers.get('CF-Connecting-IP') || '')),
-      now, product.id
-    ),
-  ]);
-  if ((results[0]?.meta?.changes ?? 0) !== 1) throw new HttpError(404, 'product_not_found');
-  return json({ product_id: product.id, status }, 200, cors);
-}
-
-async function handleMyProducts(request, env, now, cors) {
-  assertEnv(env, ['DB', 'FIREBASE_PROJECT_ID']);
-  const user = await requireSeller(request, env, now);
-  const biz = await loadOwnedBusiness(env, user.id);
-  if (!biz) throw new HttpError(404, 'business_not_found');
-
-  const rows = await env.DB.prepare(
-    `SELECT id, name, price_ugx, offer_price_ugx, offer_starts_at, offer_ends_at,
-            category_id, commission_bps, referee_max, delivery_days, status,
-            created_at, updated_at
-     FROM products WHERE business_id = ? ORDER BY created_at DESC`
-  ).bind(biz.id).all();
-
-  return json(
-    {
-      products: (rows.results || []).map((p) => ({
-        id: p.id,
-        name: p.name,
-        price_ugx: Number(p.price_ugx),
-        offer_price_ugx: p.offer_price_ugx != null ? Number(p.offer_price_ugx) : null,
-        offer_starts_at: p.offer_starts_at,
-        offer_ends_at: p.offer_ends_at,
-        category_id: p.category_id,
-        commission_bps: Number(p.commission_bps),
-        referee_max: Number(p.referee_max),
-        delivery_days: Number(p.delivery_days),
-        status: p.status,
-        created_at: Number(p.created_at),
-        updated_at: Number(p.updated_at),
-      })),
-    },
-    200,
-    cors
-  );
-}
-
-async function handleProductSlots(request, env, productId, now, cors) {
-  assertEnv(env, ['DB', 'FIREBASE_PROJECT_ID']);
-  const user = await requireSeller(request, env, now);
-  const product = await loadProductOwned(env, productId, user.id);
-  if (!product) throw new HttpError(404, 'product_not_found');
-
-  const rows = await env.DB.prepare(
-    `SELECT s.id, s.status, s.claimed_at, s.activated_at, s.released_at, s.expires_at,
-            u.id AS referee_user_id, ru.username AS referee_username
-     FROM product_referee_slots s
-     JOIN users u ON u.id = s.referee_user_id
-     LEFT JOIN referee_usernames ru ON ru.user_id = u.id
-     WHERE s.product_id = ?
-     ORDER BY s.claimed_at DESC`
-  ).bind(product.id).all();
-
-  return json(
-    {
-      product_id: product.id,
-      slots: (rows.results || []).map((r) => ({
-        id: r.id,
-        referee_username: r.referee_username || null,
-        status: r.status,
-        claimed_at: Number(r.claimed_at),
-        activated_at: r.activated_at != null ? Number(r.activated_at) : null,
-        released_at: r.released_at != null ? Number(r.released_at) : null,
-        expires_at: r.expires_at != null ? Number(r.expires_at) : null,
-      })),
-    },
-    200,
-    cors
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Referee handlers                                                   */
-/* ------------------------------------------------------------------ */
-
-async function handleClaimSlot(request, env, productId, now, cors) {
-  assertEnv(env, ['DB', 'HASH_SALT', 'FIREBASE_PROJECT_ID']);
-  const { user } = await requireAuth(request, env, now);
-  requireAccountType(user, 'referee');
-  assertId(productId, 'invalid_product_id');
-
-  // Must have a username.
-  const uname = await env.DB.prepare(
-    'SELECT username FROM referee_usernames WHERE user_id = ? LIMIT 1'
-  ).bind(user.id).first();
-  if (!uname) throw new HttpError(403, 'referee_username_required');
-
-  // Product must be active and belong to an approved business.
-  const product = await env.DB.prepare(
-    `SELECT p.id, p.business_id, p.referee_max, p.commission_bps, p.status,
-            b.owner_user_id, b.approval_status
-     FROM products p JOIN businesses b ON b.id = p.business_id
-     WHERE p.id = ? LIMIT 1`
-  ).bind(productId).first();
-  if (!product) throw new HttpError(404, 'product_not_found');
-  if (product.status !== 'active') throw new HttpError(404, 'product_not_found');
-  if (product.approval_status !== 'approved') throw new HttpError(404, 'product_not_found');
-
-  // Referee cannot be the owner.
-  if (product.owner_user_id === user.id) throw new HttpError(400, 'own_product');
-
-  const slotId = generateId('slot_');
-  const ipHash = await hmacHex(env, 'ip:' + (request.headers.get('CF-Connecting-IP') || ''));
-  const expiresAt = now + SLOT_TTL_SECONDS;
-
-  let results;
-  try {
-    results = await env.DB.batch([
-      env.DB.prepare(
-        `INSERT INTO product_referee_slots
-           (id, product_id, referee_user_id, status, claimed_at, expires_at)
-         SELECT ?, ?, ?, 'pending', ?, ?
-         WHERE (SELECT COUNT(*) FROM product_referee_slots
-                WHERE product_id = ? AND status IN ('pending','active')) < ?
-           AND NOT EXISTS (
-             SELECT 1 FROM product_referee_slots
-             WHERE product_id = ? AND referee_user_id = ? AND status IN ('pending','active')
-           )`
-      ).bind(
-        slotId, product.id, user.id, now, expiresAt,
-        product.id, Number(product.referee_max),
-        product.id, user.id
-      ),
-      env.DB.prepare(
-        `INSERT INTO audit_log
-           (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE EXISTS (SELECT 1 FROM product_referee_slots WHERE id = ?)`
-      ).bind(
-        generateId('aud_'), user.id, 'referee_slot_claimed', 'product', product.id,
-        JSON.stringify({ slot_id: slotId }), ipHash, now, slotId
-      ),
-    ]);
-  } catch (err) {
-    const msg = String(err?.message || '');
-    if (msg.includes('UNIQUE')) throw new HttpError(409, 'slot_already_claimed');
-    throw err;
+  const existing = await env.DB.prepare(
+    `SELECT category_id, score, updated_at FROM user_interests
+     WHERE owner_key = ? AND category_id IN (${placeholders})`
+  ).bind(owner.ownerKey, ...catIds).all();
+  const existMap = new Map();
+  for (const r of existing.results || []) {
+    existMap.set(r.category_id, { score: Number(r.score), updated_at: Number(r.updated_at) });
   }
 
+  const batchStmts = [];
+  batchStmts.push(
+    env.DB.prepare(
+      `INSERT INTO picker_usage (owner_key, used_at)
+       SELECT ?, ?
+       WHERE NOT EXISTS (SELECT 1 FROM picker_usage WHERE owner_key = ?)`
+    ).bind(owner.ownerKey, now, owner.ownerKey)
+  );
+
+  for (const cid of catIds) {
+    const cur = existMap.get(cid) || { score: 0, updated_at: now };
+    const decayed = decayScore(cur.score, Math.max(0, now - cur.updated_at));
+    let next = decayed + 10;
+    if (next > INTEREST_CAP) next = INTEREST_CAP;
+    batchStmts.push(
+      env.DB.prepare(
+        `INSERT INTO user_interests (owner_key, category_id, score, updated_at)
+         SELECT ?, ?, ?, ?
+         WHERE EXISTS (SELECT 1 FROM picker_usage WHERE owner_key = ? AND used_at = ?)
+         ON CONFLICT(owner_key, category_id) DO UPDATE SET
+           score = excluded.score, updated_at = excluded.updated_at`
+      ).bind(owner.ownerKey, cid, next, now, owner.ownerKey, now)
+    );
+  }
+
+  const results = await env.DB.batch(batchStmts);
   if ((results[0]?.meta?.changes ?? 0) !== 1) {
-    // Could be full OR already holds a slot. Disambiguate for a clean error.
-    const existing = await env.DB.prepare(
-      `SELECT id FROM product_referee_slots
-       WHERE product_id = ? AND referee_user_id = ? AND status IN ('pending','active') LIMIT 1`
-    ).bind(product.id, user.id).first();
-    if (existing) throw new HttpError(409, 'slot_already_claimed');
-    throw new HttpError(409, 'slots_full');
+    throw new HttpError(409, 'picker_already_used');
   }
 
-  return json(
-    {
-      slot: {
-        id: slotId,
-        product_id: product.id,
-        status: 'pending',
-        claimed_at: now,
-        expires_at: expiresAt,
-      },
-      link_params: { product_id: product.id, referee_username: uname.username },
-    },
-    201,
-    cors
-  );
-}
-
-async function handleMySlots(request, env, now, cors) {
-  assertEnv(env, ['DB', 'FIREBASE_PROJECT_ID']);
-  const { user } = await requireAuth(request, env, now);
-  requireAccountType(user, 'referee');
-
-  const rows = await env.DB.prepare(
-    `SELECT s.id, s.product_id, s.status, s.claimed_at, s.activated_at, s.released_at, s.expires_at,
-            p.name AS product_name, p.price_ugx, p.offer_price_ugx, p.offer_starts_at, p.offer_ends_at,
-            p.commission_bps
-     FROM product_referee_slots s
-     JOIN products p ON p.id = s.product_id
-     WHERE s.referee_user_id = ?
-     ORDER BY s.claimed_at DESC`
-  ).bind(user.id).all();
-
-  return json(
-    {
-      slots: (rows.results || []).map((r) => {
-        const { price } = effectivePrice(r, now);
-        return {
-          id: r.id,
-          product_id: r.product_id,
-          product_name: r.product_name,
-          effective_price_ugx: price,
-          commission_bps: Number(r.commission_bps),
-          status: r.status,
-          claimed_at: Number(r.claimed_at),
-          activated_at: r.activated_at != null ? Number(r.activated_at) : null,
-          released_at: r.released_at != null ? Number(r.released_at) : null,
-          expires_at: r.expires_at != null ? Number(r.expires_at) : null,
-        };
-      }),
-    },
-    200,
-    cors
-  );
+  return json({ ok: true, applied: catIds.length }, 200, cors);
 }
 
 /* ------------------------------------------------------------------ */
-/* Internal handlers (service-to-service)                             */
+/* Internal handlers                                                  */
 /* ------------------------------------------------------------------ */
 
 async function requireInternal(request, env) {
@@ -1526,179 +1348,143 @@ async function requireInternal(request, env) {
   }
 }
 
-async function handleCheckoutQuote(request, env, now) {
+async function handleInternalEvent(request, env, now) {
   await requireInternal(request, env);
   const body = await readJson(request);
-  const productId = assertId(body.product_id, 'invalid_product_id');
-  let refereeUserId = null;
-  if (body.referee_user_id != null) {
-    refereeUserId = assertId(body.referee_user_id, 'invalid_referee_user_id');
+
+  if (typeof body.user_id !== 'string' || body.user_id.length === 0 || body.user_id.length >= MAX_ID_LENGTH) {
+    throw new HttpError(400, 'invalid_user_id');
   }
+  if (typeof body.type !== 'string' || !INTERNAL_EVENT_TYPES.has(body.type)) {
+    throw new HttpError(400, 'invalid_event_type');
+  }
+  if (typeof body.product_id !== 'string' || body.product_id.length === 0 || body.product_id.length >= MAX_ID_LENGTH) {
+    throw new HttpError(400, 'invalid_product_id');
+  }
+  if (typeof body.ref !== 'string' || body.ref.length === 0 || body.ref.length > 128) {
+    throw new HttpError(400, 'invalid_ref');
+  }
+  const region = typeof body.region === 'string' && body.region.length > 0 && body.region.length <= 32
+    ? body.region
+    : 'ALL';
 
   const product = await env.DB.prepare(
-    `SELECT p.*, b.referrer_user_id, b.referrer_bps, b.approval_status, b.owner_user_id
+    `SELECT p.id, p.business_id, p.category_id
      FROM products p JOIN businesses b ON b.id = p.business_id
-     WHERE p.id = ? LIMIT 1`
-  ).bind(productId).first();
+     WHERE p.id = ? AND p.status = 'active' AND b.approval_status = 'approved' LIMIT 1`
+  ).bind(body.product_id).first();
   if (!product) throw new HttpError(404, 'product_not_found');
-  if (product.status !== 'active') throw new HttpError(404, 'product_not_found');
-  if (product.approval_status !== 'approved') throw new HttpError(404, 'product_not_found');
 
-  const settings = await loadPlatformSettings(env);
-  const { price } = effectivePrice(product, now);
+  const ownerKey = 'u:' + body.user_id;
+  const weight = EVENT_WEIGHTS[body.type];
+  const today = Math.floor(now / 86400);
 
-  let productRefereeBps = 0;
-  let slotStatus = null;
-  if (refereeUserId) {
-    if (product.owner_user_id === refereeUserId) {
-      throw new HttpError(400, 'own_product');
-    }
-    const slot = await env.DB.prepare(
-      `SELECT id, status FROM product_referee_slots
-       WHERE product_id = ? AND referee_user_id = ? AND status IN ('pending','active') LIMIT 1`
-    ).bind(product.id, refereeUserId).first();
-    if (slot) {
-      slotStatus = slot.status;
-      productRefereeBps = Number(product.commission_bps);
-    }
+  const cur = await env.DB.prepare(
+    `SELECT score, updated_at FROM user_interests
+     WHERE owner_key = ? AND category_id = ? LIMIT 1`
+  ).bind(ownerKey, product.category_id).first();
+
+  const decayed = decayScore(Number(cur?.score || 0), Math.max(0, now - Number(cur?.updated_at || now)));
+  let next = decayed + weight;
+  if (next > INTEREST_CAP) next = INTEREST_CAP;
+  if (next < 0) next = 0;
+
+  const eventId = generateId('evt_');
+  const batchStmts = [
+    env.DB.prepare(
+      `INSERT INTO events
+         (id, owner_key, user_id, visitor_id, type, product_id, business_id,
+          category_id, query, region, ip_hash, ref, created_at)
+       SELECT ?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, NULL, ?, ?
+       WHERE NOT EXISTS (
+         SELECT 1 FROM events WHERE user_id = ? AND type = ? AND product_id = ? AND ref = ?
+       )`
+    ).bind(
+      eventId, ownerKey, body.user_id, body.type, product.id, product.business_id,
+      product.category_id, region, body.ref, now,
+      body.user_id, body.type, product.id, body.ref
+    ),
+    env.DB.prepare(
+      `INSERT INTO user_interests (owner_key, category_id, score, updated_at)
+       SELECT ?, ?, ?, ?
+       WHERE EXISTS (SELECT 1 FROM events WHERE id = ?)
+       ON CONFLICT(owner_key, category_id) DO UPDATE SET
+         score = excluded.score, updated_at = excluded.updated_at`
+    ).bind(ownerKey, product.category_id, next, now, eventId),
+    env.DB.prepare(
+      `UPDATE user_interests SET score = ?, updated_at = ?
+       WHERE owner_key = ? AND category_id = ?
+         AND EXISTS (SELECT 1 FROM events WHERE id = ?)`
+    ).bind(next, now, ownerKey, product.category_id, eventId),
+  ];
+  for (const reg of new Set([region, 'ALL'])) {
+    batchStmts.push(
+      env.DB.prepare(
+        `INSERT INTO product_daily_stats (day, product_id, region, points)
+         SELECT ?, ?, ?, ?
+         WHERE EXISTS (SELECT 1 FROM events WHERE id = ?)
+         ON CONFLICT(day, product_id, region) DO UPDATE SET points = points + excluded.points`
+      ).bind(today, product.id, reg, weight, eventId)
+    );
   }
 
-  const businessReferrerId = product.referrer_user_id || null;
-  const businessReferrerBps = Number(product.referrer_bps || 0);
-
-  const totalBps = productRefereeBps + businessReferrerBps + settings.earnity_bps + settings.seller_reserve_bps;
-  if (totalBps > settings.deposit_cap_bps) {
-    throw new HttpError(400, 'deposit_cap_exceeded');
+  const results = await env.DB.batch(batchStmts);
+  const stored = (results[0]?.meta?.changes ?? 0) === 1;
+  if (!stored) {
+    const exists = await env.DB.prepare(
+      `SELECT 1 FROM events WHERE user_id = ? AND type = ? AND product_id = ? AND ref = ? LIMIT 1`
+    ).bind(body.user_id, body.type, product.id, body.ref).first();
+    if (!exists) throw new HttpError(500, 'insert_failed');
   }
 
-  const refereeShare = Math.floor((price * productRefereeBps) / 10000);
-  const referrerShare = Math.floor((price * businessReferrerBps) / 10000);
-  const reserveShare = Math.floor((price * settings.seller_reserve_bps) / 10000);
-  const earnityShareRaw = Math.floor((price * settings.earnity_bps) / 10000);
-  
-  // Deposit is the floored total; leftover shillings go to Earnity.
-  const totalDeposit = Math.floor((price * totalBps) / 10000);
-  const earnityShare = totalDeposit - refereeShare - referrerShare - reserveShare;
-
-  return json(
-    {
-      product_id: product.id,
-      effective_price_ugx: price,
-      product_referee_bps: productRefereeBps,
-      business_referrer_user_id: businessReferrerId,
-      business_referrer_bps: businessReferrerBps,
-      earnity_bps: settings.earnity_bps,
-      seller_reserve_bps: settings.seller_reserve_bps,
-      shares: {
-        product_referee_ugx: refereeShare,
-        business_referrer_ugx: referrerShare,
-        seller_reserve_ugx: reserveShare,
-        earnity_ugx: earnityShare,
-      },
-      total_deposit_ugx: totalDeposit,
-      slot_status: slotStatus,
-    },
-    200,
-    {}
-  );
+  return json({ stored, duplicate: !stored }, 200, {});
 }
 
-async function handleSlotActivate(request, env, now) {
+async function handleInternalPurge(request, env, now) {
   await requireInternal(request, env);
-  const body = await readJson(request);
-  const productId = assertId(body.product_id, 'invalid_product_id');
-  const refereeUserId = assertId(body.referee_user_id, 'invalid_referee_user_id');
-  const paymentId = assertId(body.payment_id, 'invalid_payment_id');
 
-  // Idempotent: only flip pending->active if payment_id not already recorded on an active slot for this pair.
-  const results = await env.DB.batch([
+  const cutoffEvents = now - PURGE_EVENTS_DAYS * 86400;
+  const cutoffStats = now - PURGE_STATS_DAYS * 86400;
+  const cutoffVisitorInterests = now - PURGE_VISITOR_INTERESTS_DAYS * 86400;
+  const statsCutoffDay = Math.floor(cutoffStats / 86400);
+
+  const r = await env.DB.batch([
     env.DB.prepare(
-      `UPDATE product_referee_slots
-       SET status = 'active', activated_at = ?, expires_at = NULL, payment_id = ?
-       WHERE product_id = ? AND referee_user_id = ? AND status = 'pending'
-         AND (payment_id IS NULL OR payment_id != ?)`
-    ).bind(now, paymentId, productId, refereeUserId, paymentId),
+      `DELETE FROM events WHERE id IN (
+         SELECT id FROM events WHERE created_at < ? LIMIT ?
+       )`
+    ).bind(cutoffEvents, PURGE_CHUNK),
     env.DB.prepare(
-      `UPDATE product_referee_slots
-       SET payment_id = ?
-       WHERE product_id = ? AND referee_user_id = ? AND status = 'active' AND payment_id IS NULL`
-    ).bind(paymentId, productId, refereeUserId),
+      `DELETE FROM product_daily_stats WHERE day < ?`
+    ).bind(statsCutoffDay),
+    env.DB.prepare(
+      `DELETE FROM user_interests WHERE owner_key LIKE 'v:%' AND updated_at < ?
+       AND owner_key NOT IN (SELECT DISTINCT owner_key FROM events WHERE created_at > ?)`
+    ).bind(cutoffVisitorInterests, cutoffVisitorInterests),
   ]);
 
-  const changed = results[0]?.meta?.changes ?? 0;
+  const deletedEvents = r[0]?.meta?.changes ?? 0;
+  const deletedStats = r[1]?.meta?.changes ?? 0;
+  const deletedVisitorInterests = r[2]?.meta?.changes ?? 0;
+
+  const more = await env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM events WHERE created_at < ?'
+  ).bind(cutoffEvents).first();
 
   return json(
     {
-      activated: changed === 1,
-      already_active: changed === 0,
-      product_id: productId,
-      referee_user_id: refereeUserId,
+      deleted_events: deletedEvents,
+      deleted_stats: deletedStats,
+      deleted_visitor_interests: deletedVisitorInterests,
+      more_events_pending: Number(more?.n || 0) > 0,
     },
     200,
     {}
   );
-}
-
-async function handleReleaseExpiredSlots(request, env, now) {
-  await requireInternal(request, env);
-
-  // Find expired pending slots first (read is fine; writes are guarded).
-  const expired = await env.DB.prepare(
-    `SELECT id, product_id, referee_user_id FROM product_referee_slots
-     WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?
-     LIMIT 500`
-  ).bind(now).all();
-
-  const slots = expired.results || [];
-  if (slots.length === 0) return json({ released: 0 }, 200, {});
-
-  const ipHash = await hmacHex(env, 'internal:release-expired');
-  const batchStmts = [];
-  for (const s of slots) {
-    batchStmts.push(
-      env.DB.prepare(
-        `UPDATE product_referee_slots
-         SET status = 'released', released_at = ?
-         WHERE id = ? AND status = 'pending' AND expires_at <= ?`
-      ).bind(now, s.id, now)
-    );
-    batchStmts.push(
-      env.DB.prepare(
-        `INSERT INTO audit_log
-           (id, actor_user_id, action, target_type, target_id, metadata, ip_hash, created_at)
-         SELECT ?, NULL, ?, ?, ?, ?, ?, ?
-         WHERE EXISTS (SELECT 1 FROM product_referee_slots WHERE id = ? AND status = 'released' AND released_at = ?)`
-      ).bind(
-        generateId('aud_'),
-        'referee_slot_released',
-        'product',
-        s.product_id,
-        JSON.stringify({ slot_id: s.id, referee_user_id: s.referee_user_id }),
-        ipHash,
-        now,
-        s.id,
-        now
-      )
-    );
-  }
-
-  await env.DB.batch(batchStmts);
-
-  const releasedCount = batchStmts
-    .filter((_, i) => i % 2 === 0) // we can't read meta easily; recount instead
-    .length;
-
-  // Recount actual released to be safe.
-  const recount = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM product_referee_slots
-     WHERE status = 'released' AND released_at = ?`
-  ).bind(now).first();
-
-  return json({ released: Number(recount?.n || 0) || releasedCount }, 200, {});
 }
 
 /* ------------------------------------------------------------------ */
-/* Worker entrypoint                                                  */
+/* Router                                                             */
 /* ------------------------------------------------------------------ */
 
 export default {
@@ -1714,7 +1500,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Internal paths: reject browser-originated requests with no CORS.
     if (path.startsWith('/internal/') && origin) {
       return json({ error: 'forbidden' }, 403, {});
     }
@@ -1734,90 +1519,45 @@ export default {
     }
 
     try {
-      /* -------- Public -------- */
       if (path === '/health' && request.method === 'GET') {
         return await handleHealth(env, now, cors);
       }
-      if (path === '/categories' && request.method === 'GET') {
-        return await handleCategories(env, cors);
+      if (path === '/chips' && request.method === 'GET') {
+        return await handleChips(env, cors);
       }
-      const publicProductMatch = path.match(/^\/products\/([^/]+)$/);
-      if (publicProductMatch && request.method === 'GET') {
-        return await handlePublicProduct(env, publicProductMatch[1], now, cors);
+      if (path === '/feed' && request.method === 'GET') {
+        return await handleFeed(request, env, now, cors);
       }
-      const storeMatch = path.match(/^\/store\/([^/]+)$/);
-      if (storeMatch && request.method === 'GET') {
-        return await handlePublicStore(env, storeMatch[1], url, now, cors);
+      if (path === '/search' && request.method === 'GET') {
+        return await handleSearch(request, env, now, cors);
       }
-
-      /* -------- Seller business -------- */
-      if (path === '/business' && request.method === 'POST') {
-        return await handleCreateBusiness(request, env, now, cors);
+      if (path === '/search/suggest' && request.method === 'GET') {
+        return await handleSuggest(request, env, now, cors);
       }
-      if (path === '/business/me' && request.method === 'GET') {
-        return await handleGetMyBusiness(request, env, now, cors);
+      if (path === '/events' && request.method === 'POST') {
+        return await handlePostEvents(request, env, now, cors);
       }
-      if (path === '/business/me' && request.method === 'PATCH') {
-        return await handlePatchMyBusiness(request, env, now, cors);
+      if (path === '/events/link' && request.method === 'POST') {
+        return await handleEventsLink(request, env, now, cors);
       }
-      if (path === '/business/me/referrer-rate' && request.method === 'POST') {
-        return await handleRaiseReferrerRate(request, env, now, cors);
+      if (path === '/interests/picker' && request.method === 'POST') {
+        return await handleInterestPicker(request, env, now, cors);
       }
-
-      /* -------- Seller products -------- */
-      if (path === '/products' && request.method === 'POST') {
-        return await handleCreateProduct(request, env, now, cors);
+      if (path === '/internal/event' && request.method === 'POST') {
+        return await handleInternalEvent(request, env, now);
       }
-      if (path === '/business/me/products' && request.method === 'GET') {
-        return await handleMyProducts(request, env, now, cors);
-      }
-      const patchProductMatch = path.match(/^\/products\/([^/]+)$/);
-      if (patchProductMatch && request.method === 'PATCH') {
-        return await handlePatchProduct(request, env, patchProductMatch[1], now, cors);
-      }
-      const offerMatch = path.match(/^\/products\/([^/]+)\/offer$/);
-      if (offerMatch && request.method === 'POST') {
-        return await handleSetOffer(request, env, offerMatch[1], now, cors);
-      }
-      const statusMatch = path.match(/^\/products\/([^/]+)\/status$/);
-      if (statusMatch && request.method === 'POST') {
-        return await handleSetStatus(request, env, statusMatch[1], now, cors);
-      }
-      const slotsMatch = path.match(/^\/products\/([^/]+)\/slots$/);
-      if (slotsMatch && request.method === 'GET') {
-        return await handleProductSlots(request, env, slotsMatch[1], now, cors);
+      if (path === '/internal/purge-events' && request.method === 'POST') {
+        return await handleInternalPurge(request, env, now);
       }
 
-      /* -------- Referee -------- */
-      const claimMatch = path.match(/^\/products\/([^/]+)\/referee-slot$/);
-      if (claimMatch && request.method === 'POST') {
-        return await handleClaimSlot(request, env, claimMatch[1], now, cors);
-      }
-      if (path === '/referee/slots' && request.method === 'GET') {
-        return await handleMySlots(request, env, now, cors);
-      }
-
-      /* -------- Internal -------- */
-      if (path === '/internal/checkout-quote' && request.method === 'POST') {
-        return await handleCheckoutQuote(request, env, now);
-      }
-      if (path === '/internal/slot-activate' && request.method === 'POST') {
-        return await handleSlotActivate(request, env, now);
-      }
-      if (path === '/internal/release-expired-slots' && request.method === 'POST') {
-        return await handleReleaseExpiredSlots(request, env, now);
-      }
-
-      // 405 for known paths with wrong method
       const knownPaths = [
-        '/health','/categories','/business','/business/me','/business/me/referrer-rate',
-        '/products','/business/me/products','/referee/slots',
-        '/internal/checkout-quote','/internal/slot-activate','/internal/release-expired-slots',
+        '/health','/chips','/feed','/search','/search/suggest',
+        '/events','/events/link','/interests/picker',
+        '/internal/event','/internal/purge-events',
       ];
       if (knownPaths.includes(path)) {
         return json({ error: 'method_not_allowed' }, 405, cors);
       }
-
       return json({ error: 'not_found' }, 404, cors);
     } catch (err) {
       if (err instanceof HttpError) {
