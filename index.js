@@ -606,18 +606,7 @@ async function handleFeed(request, env, now, cors) {
     .filter((p) => !dismissed.has(p.id))
     .slice(0, FEED_POOL_SIZE);
 
-  const slotsUsedMap = new Map();
-  if (candidates.length > 0) {
-    const ids = candidates.map((p) => p.id);
-    const placeholders = ids.map(() => '?').join(',');
-    const rows = await env.DB.prepare(
-      `SELECT product_id, COUNT(*) AS n FROM product_referee_slots
-       WHERE status IN ('pending','active') AND product_id IN (${placeholders})
-       GROUP BY product_id`
-    ).bind(...ids).all();
-    for (const r of rows.results || []) slotsUsedMap.set(r.product_id, Number(r.n));
-  }
-
+   
   const scored = candidates.map((p) => {
     const { price, offer_active } = effectivePrice(p, now);
     const trendPts = trending.get(p.id) || 0;
@@ -646,7 +635,7 @@ async function handleFeed(request, env, now, cors) {
       offer_active,
       trendPts,
       score,
-      slotsUsed: slotsUsedMap.get(p.id) || 0,
+           slotsUsed: 0,
     };
   });
 
@@ -688,7 +677,20 @@ async function handleFeed(request, env, now, cors) {
     ordered.push(...block);
     remaining = rest;
   }
-  const pageItems = ordered.slice(offset, offset + limit);
+    const pageItems = ordered.slice(offset, offset + limit);
+
+  const slotsUsedMap = new Map();
+  if (pageItems.length > 0) {
+    const ids = pageItems.map((s) => s.product.id);
+    const ph = ids.map(() => '?').join(',');
+    const rows = await env.DB.prepare(
+      `SELECT product_id, COUNT(*) AS n FROM product_referee_slots
+       WHERE status IN ('pending','active') AND product_id IN (${ph})
+       GROUP BY product_id`
+    ).bind(...ids).all();
+    for (const r of rows.results || []) slotsUsedMap.set(r.product_id, Number(r.n));
+  }
+  for (const s of pageItems) s.slotsUsed = slotsUsedMap.get(s.product.id) || 0;
 
   const nextOffset = offset + pageItems.length;
   const hasMore = nextOffset < ordered.length && nextOffset < FEED_MAX_OFFSET;
